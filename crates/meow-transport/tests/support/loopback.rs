@@ -317,10 +317,12 @@ async fn spawn_grpc_server_inner(
 pub struct H2ReqInfo {
     /// The HTTP method sent by the client (e.g. `POST`).
     pub method: String,
+    /// The `:scheme` pseudo-header sent by the client.
+    pub scheme: Option<String>,
     /// The `:authority` pseudo-header sent by the client (e.g. `"example.com"`).
     pub authority: Option<String>,
-    /// The `:path` pseudo-header sent by the client (e.g. `"/custom"`).
-    pub path: String,
+    /// The request path and query (e.g. `"/custom?ed=1"`).
+    pub path_and_query: String,
     /// Request headers.
     pub headers: http::HeaderMap,
 }
@@ -355,6 +357,64 @@ pub async fn spawn_h2_server_deferred_response(
     max_connections: usize,
 ) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<H2ReqInfo>) {
     spawn_h2_server_inner(max_connections, true).await
+}
+/// Spawn one H2 echo connection and report the exact request body after a
+/// clean request-body EOS. A reset drops the sender without a value.
+#[cfg(any(feature = "h2", feature = "xhttp"))]
+pub async fn spawn_h2_server_with_body_result() -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<std::result::Result<Vec<u8>, String>>,
+) {
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("h2 body-result bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    tokio::spawn(async move {
+        let result = async {
+            let (tcp, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let mut conn = h2::server::handshake(tcp)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (request, mut respond) = conn
+                .accept()
+                .await
+                .ok_or_else(|| "connection closed before request".to_string())?
+                .map_err(|e| e.to_string())?;
+            respond
+                .send_response(http::Response::new(()), false)
+                .map_err(|e| e.to_string())?
+                .send_data(bytes::Bytes::from_static(b"!"), true)
+                .map_err(|e| e.to_string())?;
+            let mut body = request.into_body();
+            let read_body = async {
+                let mut received = Vec::new();
+                loop {
+                    match body.data().await {
+                        Some(Ok(bytes)) => {
+                            let _ = body.flow_control().release_capacity(bytes.len());
+                            received.extend_from_slice(&bytes);
+                        }
+                        Some(Err(error)) => return Err(error.to_string()),
+                        None => return Ok(received),
+                    }
+                }
+            };
+            let drive = async {
+                while conn.accept().await.is_some() {}
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                result = read_body => result,
+                () = drive => unreachable!("drive future never resolves"),
+            }
+        }
+        .await;
+        let _ = body_tx.send(result);
+    });
+
+    (addr, body_rx)
 }
 
 #[cfg(any(feature = "h2", feature = "xhttp"))]
@@ -400,8 +460,12 @@ async fn h2_handle_conn(
     };
 
     let method = req.method().to_string();
+    let scheme = req.uri().scheme().map(std::string::ToString::to_string);
     let authority = req.uri().authority().map(std::string::ToString::to_string);
-    let path = req.uri().path().to_string();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), std::string::ToString::to_string);
     let headers = req.headers().clone();
 
     // Publish the request metadata as soon as the HEADERS arrive, so tests can
@@ -409,8 +473,9 @@ async fn h2_handle_conn(
     let _ = tx
         .send(H2ReqInfo {
             method,
+            scheme,
             authority,
-            path,
+            path_and_query,
             headers,
         })
         .await;

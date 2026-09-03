@@ -1402,9 +1402,9 @@ fn parse_vless(
     if tls {
         use meow_transport::tls::{TlsConfig, TlsLayer};
         let sni = if servername.is_empty() {
-            server.to_string()
+            server
         } else {
-            servername
+            servername.as_str()
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
@@ -1569,118 +1569,8 @@ fn parse_vless(
             chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
         }
         "xhttp" => {
-            use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
-            let xhttp_opts = config.get("xhttp-opts");
-            let path = xhttp_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            let hosts: Vec<String> = xhttp_opts.and_then(|o| o.get("host")).map_or_else(
-                || vec![server.to_string()],
-                |v| {
-                    if let Some(s) = v.as_str() {
-                        vec![s.to_string()]
-                    } else if let Some(seq) = v.as_sequence() {
-                        seq.iter()
-                            .filter_map(|item| item.as_str().map(std::string::ToString::to_string))
-                            .collect()
-                    } else {
-                        vec![server.to_string()]
-                    }
-                },
-            );
-            if hosts.is_empty() {
-                return Err(format!(
-                    "vless: xhttp-opts.host must not be empty for proxy '{name}'"
-                ));
-            }
-            let mode = xhttp_opts
-                .and_then(|o| o.get("mode"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("stream-one")
-                .to_string();
-            if !mode.is_empty()
-                && !mode.eq_ignore_ascii_case("auto")
-                && !mode.eq_ignore_ascii_case("stream-one")
-            {
-                return Err(format!(
-                    "vless: unsupported xhttp mode '{mode}'; only 'stream-one' and 'auto' are supported"
-                ));
-            }
-            let extra_headers: Vec<(String, String)> = xhttp_opts
-                .and_then(|o| o.get("headers"))
-                .and_then(|h| h.as_mapping())
-                .map(|m| {
-                    m.iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.as_str()?.to_string();
-                            let val = v.as_str()?.to_string();
-                            Some((key, val))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let no_grpc_header = xhttp_opts
-                .and_then(|o| o.get("no-grpc-header"))
-                .and_then(serde_yaml::Value::as_bool)
-                .unwrap_or(false);
-            let x_padding_bytes =
-                if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
-                    if let Some(s) = padding_val.as_str() {
-                        let parts: Vec<&str> = s.split('-').collect();
-                        if parts.len() == 2 {
-                            let min = parts[0].trim().parse::<usize>().map_err(|e| {
-                                format!("vless: invalid min in x-padding-bytes '{s}': {e}")
-                            })?;
-                            let max = parts[1].trim().parse::<usize>().map_err(|e| {
-                                format!("vless: invalid max in x-padding-bytes '{s}': {e}")
-                            })?;
-                            if min > max {
-                                return Err(format!(
-                                    "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                                ));
-                            }
-                            Some((min, max))
-                        } else {
-                            return Err(format!(
-                                "vless: invalid x-padding-bytes range '{s}', expected 'min-max'"
-                            ));
-                        }
-                    } else if let Some(seq) = padding_val.as_sequence() {
-                        if seq.len() == 2 {
-                            let min = seq[0].as_u64().ok_or_else(|| {
-                                "vless: invalid min in x-padding-bytes".to_string()
-                            })? as usize;
-                            let max = seq[1].as_u64().ok_or_else(|| {
-                                "vless: invalid max in x-padding-bytes".to_string()
-                            })? as usize;
-                            if min > max {
-                                return Err(format!(
-                                    "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                                ));
-                            }
-                            Some((min, max))
-                        } else {
-                            return Err(
-                                "vless: x-padding-bytes array must have 2 elements".to_string()
-                            );
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    Some((100, 1000))
-                };
-            let xhttp_cfg = XhttpConfig {
-                path,
-                hosts,
-                extra_headers,
-                mode,
-                no_grpc_header,
-                x_padding_bytes,
-            };
-            chain.push(Box::new(XhttpLayer::new(xhttp_cfg)));
+            let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+            chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
         }
         other => {
             return Err(format!(
@@ -1934,6 +1824,136 @@ fn mux_usize_field(
             "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
         )),
     }
+}
+#[cfg(feature = "vless")]
+fn parse_vless_xhttp_config(
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+    servername: &str,
+    tls: bool,
+) -> std::result::Result<meow_transport::xhttp::XhttpConfig, String> {
+    use meow_transport::xhttp::XhttpConfig;
+
+    let xhttp_opts = config.get("xhttp-opts");
+    let path = xhttp_opts
+        .and_then(|o| o.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let fallback_host = if servername.is_empty() {
+        server
+    } else {
+        servername
+    };
+    let hosts: Vec<String> = match xhttp_opts.and_then(|o| o.get("host")) {
+        None => vec![fallback_host.to_string()],
+        Some(value) if value.is_string() => {
+            vec![value.as_str().expect("checked string").to_string()]
+        }
+        Some(value) if value.is_sequence() => value
+            .as_sequence()
+            .expect("checked sequence")
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(std::string::ToString::to_string)
+                    .ok_or_else(|| "vless: xhttp-opts.host entries must be strings".to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err("vless: xhttp-opts.host must be a string or string array".into());
+        }
+    };
+    if hosts.is_empty() {
+        return Err("vless: xhttp-opts.host must not be empty".into());
+    }
+    let mode = xhttp_opts
+        .and_then(|o| o.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("stream-one")
+        .to_string();
+    if !mode.eq_ignore_ascii_case("stream-one") {
+        return Err(format!(
+            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
+        ));
+    }
+    let extra_headers: Vec<(String, String)> = xhttp_opts
+        .and_then(|o| o.get("headers"))
+        .and_then(|h| h.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let val = v.as_str()?.to_string();
+                    Some((key, val))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let no_grpc_header = xhttp_opts
+        .and_then(|o| o.get("no-grpc-header"))
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    let x_padding_bytes =
+        if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
+            if let Some(s) = padding_val.as_str() {
+                let parts: Vec<&str> = s.split('-').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
+                        "vless: invalid x-padding-bytes range '{s}', expected 'min-max'"
+                    ));
+                }
+                let min = parts[0]
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| format!("vless: invalid min in x-padding-bytes '{s}': {e}"))?;
+                let max = parts[1]
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| format!("vless: invalid max in x-padding-bytes '{s}': {e}"))?;
+                if min > max {
+                    return Err(format!(
+                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
+                    ));
+                }
+                Some((min, max))
+            } else if let Some(seq) = padding_val.as_sequence() {
+                if seq.len() != 2 {
+                    return Err("vless: x-padding-bytes array must have 2 elements".into());
+                }
+                let min = seq[0]
+                    .as_u64()
+                    .ok_or_else(|| "vless: invalid min in x-padding-bytes".to_string())?
+                    as usize;
+                let max = seq[1]
+                    .as_u64()
+                    .ok_or_else(|| "vless: invalid max in x-padding-bytes".to_string())?
+                    as usize;
+                if min > max {
+                    return Err(format!(
+                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
+                    ));
+                }
+                Some((min, max))
+            } else {
+                return Err(
+                    "vless: x-padding-bytes must be a 'min-max' string or 2-element integer array"
+                        .to_string(),
+                );
+            }
+        } else {
+            Some((100, 1000))
+        };
+
+    Ok(XhttpConfig {
+        path,
+        hosts,
+        scheme: if tls { "https" } else { "http" }.to_string(),
+        extra_headers,
+        mode,
+        no_grpc_header,
+        x_padding_bytes,
+    })
 }
 
 /// Parse the VLESS `encryption` field.
@@ -2622,6 +2642,39 @@ mod tests {
         );
         // Plain TCP keeps ALPN absent.
         assert!(default_transport_alpn("tcp", Vec::new()).is_empty());
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_config_resolves_fields_and_fallbacks() {
+        let full = proxy_config(
+            "name: v\ntype: vless\nserver: 203.0.113.7\nport: 443\n\
+             uuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\n\
+             servername: cdn.example.com\nnetwork: xhttp\nxhttp-opts:\n\
+             \x20 path: /testpath\n\x20 host: xhttp.example.com\n\
+             \x20 mode: stream-one\n\x20 no-grpc-header: true\n\
+             \x20 x-padding-bytes: 200-800\n\x20 headers:\n\x20\x20 X-Custom: Hello\n",
+        );
+        let parsed = parse_vless_xhttp_config(&full, "203.0.113.7", "cdn.example.com", true)
+            .expect("full xhttp config");
+        assert_eq!(parsed.path, "/testpath");
+        assert_eq!(parsed.hosts, ["xhttp.example.com"]);
+        assert_eq!(parsed.scheme, "https");
+        assert_eq!(parsed.mode, "stream-one");
+        assert!(parsed.no_grpc_header);
+        assert_eq!(parsed.x_padding_bytes, Some((200, 800)));
+        assert_eq!(parsed.extra_headers, [("X-Custom".into(), "Hello".into())]);
+
+        let fallback = proxy_config("xhttp-opts:\n  path: /fallback\n");
+        let parsed = parse_vless_xhttp_config(&fallback, "203.0.113.7", "cdn.example.com", true)
+            .expect("fallback xhttp config");
+        assert_eq!(parsed.hosts, ["cdn.example.com"]);
+        assert_eq!(parsed.x_padding_bytes, Some((100, 1000)));
+
+        let parsed = parse_vless_xhttp_config(&HashMap::new(), "2001:db8::1", "", false)
+            .expect("h2c xhttp config");
+        assert_eq!(parsed.hosts, ["2001:db8::1"]);
+        assert_eq!(parsed.scheme, "http");
     }
 
     #[test]

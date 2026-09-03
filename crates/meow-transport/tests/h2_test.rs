@@ -206,7 +206,7 @@ async fn h2_path_forwarded() {
         .expect("channel closed");
 
     assert_eq!(
-        info.path, "/custom",
+        info.path_and_query, "/custom",
         ":path must match configured H2Config.path"
     );
 }

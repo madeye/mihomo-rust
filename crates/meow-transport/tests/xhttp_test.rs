@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
 use meow_transport::{Transport, TransportError};
-use support::loopback::{spawn_h2_server, spawn_h2_server_deferred_response};
+use support::loopback::{
+    spawn_h2_server, spawn_h2_server_deferred_response, spawn_h2_server_with_body_result,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn assert_xhttp_config_error(case: &str, config: XhttpConfig, expected: &str) {
-    let (client, _server) = tokio::io::duplex(64);
+    let (client, server) = tokio::io::duplex(64);
+    drop(server);
     let layer = XhttpLayer::new(config);
     let Err(err) = layer.connect(Box::new(client)).await else {
         panic!("[{case}] invalid xhttp config unexpectedly connected");
@@ -42,15 +45,17 @@ async fn xhttp_round_trip_1mib() {
         .expect("tcp connect");
 
     let layer = XhttpLayer::new(XhttpConfig {
-        path: "/xhttp-test".into(),
+        path: "/xhttp-test?ed=1".into(),
         hosts: vec!["example.com".into()],
+        x_padding_bytes: Some((128, 128)),
         ..Default::default()
     });
     let stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
 
     let req_info = rx.recv().await.expect("server received request info");
     assert_eq!(req_info.method, "POST");
-    assert_eq!(req_info.path, "/xhttp-test");
+    assert_eq!(req_info.scheme.as_deref(), Some("https"));
+    assert_eq!(req_info.path_and_query, "/xhttp-test?ed=1");
     assert_eq!(req_info.authority.as_deref(), Some("example.com"));
     assert_eq!(
         req_info
@@ -59,8 +64,16 @@ async fn xhttp_round_trip_1mib() {
             .and_then(|v| v.to_str().ok()),
         Some("application/grpc")
     );
-    assert!(req_info.headers.contains_key("referer"));
-
+    let referer = req_info
+        .headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .expect("default padding Referer");
+    let padding = referer
+        .strip_prefix("https://example.com/xhttp-test?x_padding=")
+        .expect("Referer must replace the original query with x_padding");
+    assert_eq!(padding.len(), 128);
+    assert!(padding.bytes().all(|b| b == b'X'));
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     let send_buf: Vec<u8> = (0u8..=255).cycle().take(PAYLOAD_SIZE).collect();
@@ -156,7 +169,8 @@ async fn xhttp_headers_and_no_grpc_header() {
 
     let req_info = rx.recv().await.expect("server received request info");
     assert_eq!(req_info.method, "POST");
-    assert_eq!(req_info.path, "/custom");
+    assert_eq!(req_info.scheme.as_deref(), Some("https"));
+    assert_eq!(req_info.path_and_query, "/custom");
     assert_eq!(req_info.authority.as_deref(), Some("custom.host"));
     assert_eq!(
         req_info
@@ -165,9 +179,7 @@ async fn xhttp_headers_and_no_grpc_header() {
             .and_then(|v| v.to_str().ok()),
         Some("val123")
     );
-    // no_grpc_header = true => content-type should not be application/grpc
     assert!(req_info.headers.get("content-type").is_none());
-    // x_padding_bytes = None => no referer header generated
     assert!(req_info.headers.get("referer").is_none());
 
     drop(stream);
@@ -201,23 +213,30 @@ async fn xhttp_round_trip_with_deferred_response() {
     assert_eq!(&buf, b"ping");
 }
 
-/// D5: Dropping stream aborts the background connection driver.
+/// D5: Dropping the stream preserves queued payload and sends clean EOS.
 #[tokio::test]
-async fn xhttp_drop_aborts_driver() {
-    let (addr, _rx) = spawn_h2_server(1).await;
+async fn xhttp_drop_sends_clean_eos() {
+    let (addr, body_rx) = spawn_h2_server_with_body_result().await;
 
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .expect("tcp connect");
 
     let layer = XhttpLayer::new(XhttpConfig::default());
-    let stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
+    let mut stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
 
-    // Drop the stream
+    stream
+        .write_all(b"payload-before-drop")
+        .await
+        .expect("write");
     drop(stream);
 
-    // Yield to let tokio run any aborted task cleanup
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+        .await
+        .expect("server must observe request-body termination")
+        .expect("server must report body result")
+        .expect("drop must send clean EOS instead of resetting the stream");
+    assert_eq!(received, b"payload-before-drop");
 }
 
 /// D6: Config validation errors.

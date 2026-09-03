@@ -9,6 +9,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+const DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Accepted response status for a lazily resolved HTTP/2 body.
 #[derive(Clone, Copy)]
 pub enum StatusPolicy {
@@ -113,6 +115,26 @@ impl RecvState {
             _ => None,
         }
     }
+
+    async fn drain(mut self) {
+        if std::future::poll_fn(|cx| self.poll_ready(cx))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Some(stream) = self.stream() else {
+            return;
+        };
+        while let Some(item) = stream.data().await {
+            match item {
+                Ok(bytes) => {
+                    let _ = stream.flow_control().release_capacity(bytes.len());
+                }
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 /// Per-poll cap on the bytes copied into `pending_write`.  Without a cap,
@@ -127,7 +149,7 @@ const WRITE_STASH_CAP: usize = 64 * 1024;
 /// Raw bidirectional bytes over one HTTP/2 request/response pair.
 pub struct H2Stream {
     send: h2::SendStream<Bytes>,
-    recv: RecvState,
+    recv: Option<RecvState>,
     read_buf: Bytes,
     /// Payload stashed while a `poll_write` waits for h2 send-window
     /// capacity — at most [`WRITE_STASH_CAP`] bytes, i.e. possibly only a
@@ -152,7 +174,7 @@ impl H2Stream {
     pub fn new(send: h2::SendStream<Bytes>, recv: RecvState) -> Self {
         Self {
             send,
-            recv,
+            recv: Some(recv),
             read_buf: Bytes::new(),
             pending_write: None,
             remote_no_error_is_eof: false,
@@ -193,9 +215,22 @@ impl H2Stream {
 impl Drop for H2Stream {
     fn drop(&mut self) {
         self.best_effort_eos();
-        if let Some(handle) = self.conn_abort.take() {
-            handle.abort();
-        }
+        let Some(abort_handle) = self.conn_abort.take() else {
+            return;
+        };
+        let recv = self.recv.take();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            abort_handle.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(recv) = recv {
+                let _ = tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, recv.drain()).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            abort_handle.abort();
+        });
     }
 }
 
@@ -219,12 +254,13 @@ impl AsyncRead for H2Stream {
                 let _ = this.read_buf.split_to(count);
                 return Poll::Ready(Ok(()));
             }
-            match this.recv.poll_ready(cx) {
+            let recv = this.recv.as_mut().expect("receive state present");
+            match recv.poll_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(())) => {}
             }
-            let recv = this.recv.stream().expect("poll_ready resolved Ok");
+            let recv = recv.stream().expect("poll_ready resolved Ok");
             match recv.poll_data(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
@@ -810,9 +846,10 @@ mod tests {
         let (send_request, connection) = h2::client::handshake(client_io)
             .await
             .expect("client handshake");
-        tokio::spawn(async move {
+        let driver_task = tokio::spawn(async move {
             let _ = connection.await;
         });
+        let abort_handle = driver_task.abort_handle();
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri("https://localhost")
@@ -822,7 +859,8 @@ mod tests {
         let (response, send_stream) = send_request
             .send_request(request, false)
             .expect("send_request");
-        let mut stream = H2Stream::new(send_stream, RecvState::new(response));
+        let mut stream =
+            H2Stream::new(send_stream, RecvState::new(response)).with_conn_abort(abort_handle);
 
         stream.write_all(b"hello").await.expect("write");
         drop(stream);
@@ -831,5 +869,10 @@ mod tests {
             .await
             .expect("server must observe end-of-stream")
             .expect("server task");
+        let driver_error = tokio::time::timeout(Duration::from_secs(5), driver_task)
+            .await
+            .expect("driver must be aborted after response drain")
+            .expect_err("driver task must end by abort");
+        assert!(driver_error.is_cancelled());
     }
 }
