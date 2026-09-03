@@ -59,6 +59,11 @@ h2 = [
 httpupgrade = [
     "dep:httparse",
 ]
+xhttp = [
+    "dep:h2",
+    "dep:http",
+    "dep:rand",
+]
 # simple-obfs (SIP004): a stream-wrapper codec that frames shadowsocks traffic
 # as fake HTTP / TLS so a passive observer sees plain web traffic. Used by both
 # the outbound SS/Snell adapters (client side, here as `simple_obfs::client`)
@@ -145,6 +150,10 @@ required-features = ["h2"]
 [[test]]
 name = "httpupgrade_test"
 required-features = ["httpupgrade"]
+
+[[test]]
+name = "xhttp_test"
+required-features = ["xhttp"]
 
 [lints]
 workspace = true

@@ -95,30 +95,44 @@ impl Transport for H2Layer {
 
         // Drive the h2 connection (SETTINGS, WINDOW_UPDATE, PING, …) in a
         // background task so control frames keep flowing while we stream data.
-        tokio::spawn(async move {
+        let driver_task = tokio::spawn(async move {
             let _ = conn.await;
         });
+        let abort_handle = driver_task.abort_handle();
 
         // h2 requires poll_ready/ready before send_request: sending
         // without readiness is rejected once MAX_CONCURRENT_STREAMS is
         // exhausted.  Bounded by OPEN_TIMEOUT — see its doc.
-        h2 = tokio::time::timeout(OPEN_TIMEOUT, h2.ready())
-            .await
-            .map_err(|_| TransportError::H2("timed out waiting for send readiness (open)".into()))?
-            .map_err(|e| TransportError::H2(e.to_string()))?;
+        h2 = match tokio::time::timeout(OPEN_TIMEOUT, h2.ready()).await {
+            Ok(Ok(ready_h2)) => ready_h2,
+            Ok(Err(e)) => {
+                abort_handle.abort();
+                return Err(TransportError::H2(e.to_string()));
+            }
+            Err(_) => {
+                abort_handle.abort();
+                return Err(TransportError::H2(
+                    "timed out waiting for send readiness (open)".into(),
+                ));
+            }
+        };
 
         // Open the h2 stream; `end_of_stream = false` — we will stream data.
-        let (response_future, send_stream) = h2
-            .send_request(request, false)
-            .map_err(|e| TransportError::H2(e.to_string()))?;
+        let (response_future, send_stream) = match h2.send_request(request, false) {
+            Ok(parts) => parts,
+            Err(e) => {
+                abort_handle.abort();
+                return Err(TransportError::H2(e.to_string()));
+            }
+        };
 
         // Do NOT await the response here: upstream's h2 handler reads the
         // client's first DATA frame before it writes anything, so awaiting
         // would deadlock the tunnel (issue #377). The response is resolved on
         // the first read instead — see `h2_common::RecvState`.
-        Ok(Box::new(H2Stream::new(
-            send_stream,
-            RecvState::new(response_future),
-        )))
+        Ok(Box::new(
+            H2Stream::new(send_stream, RecvState::new(response_future))
+                .with_conn_abort(abort_handle),
+        ))
     }
 }

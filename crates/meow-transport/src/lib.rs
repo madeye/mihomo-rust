@@ -37,7 +37,7 @@ mod reality_tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
-#[cfg(any(feature = "grpc", feature = "h2"))]
+#[cfg(any(feature = "grpc", feature = "h2", feature = "xhttp"))]
 pub mod h2_common;
 
 #[cfg(feature = "grpc")]
@@ -48,6 +48,9 @@ pub mod h2;
 
 #[cfg(feature = "httpupgrade")]
 pub mod httpupgrade;
+
+#[cfg(feature = "xhttp")]
+pub mod xhttp;
 
 /// SIP004 simple-obfs HTTP/TLS obfuscation codec (client +, later, server).
 /// Gated by the `simple-obfs` feature; see [`simple_obfs::client`] for the

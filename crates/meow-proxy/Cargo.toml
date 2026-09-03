@@ -100,7 +100,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # Loopback anytls *server* for the integration tests (rustls-based, test-only).
 meow-anytls = { workspace = true, features = ["server"] }
 meow-trie = { workspace = true }
+meow-transport = { workspace = true, features = ["xhttp"] }
 rcgen = "0.13"
+http = "1"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }

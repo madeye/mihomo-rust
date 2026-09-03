@@ -28,6 +28,9 @@ pub enum TransportError {
     #[error("http upgrade: {0}")]
     HttpUpgrade(String),
 
+    #[error("xhttp: {0}")]
+    Xhttp(String),
+
     #[error("invalid config: {0}")]
     Config(String),
 }

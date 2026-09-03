@@ -1568,9 +1568,123 @@ fn parse_vless(
             };
             chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
         }
+        "xhttp" => {
+            use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
+            let xhttp_opts = config.get("xhttp-opts");
+            let path = xhttp_opts
+                .and_then(|o| o.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("/")
+                .to_string();
+            let hosts: Vec<String> = xhttp_opts.and_then(|o| o.get("host")).map_or_else(
+                || vec![server.to_string()],
+                |v| {
+                    if let Some(s) = v.as_str() {
+                        vec![s.to_string()]
+                    } else if let Some(seq) = v.as_sequence() {
+                        seq.iter()
+                            .filter_map(|item| item.as_str().map(std::string::ToString::to_string))
+                            .collect()
+                    } else {
+                        vec![server.to_string()]
+                    }
+                },
+            );
+            if hosts.is_empty() {
+                return Err(format!(
+                    "vless: xhttp-opts.host must not be empty for proxy '{name}'"
+                ));
+            }
+            let mode = xhttp_opts
+                .and_then(|o| o.get("mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("stream-one")
+                .to_string();
+            if !mode.is_empty()
+                && !mode.eq_ignore_ascii_case("auto")
+                && !mode.eq_ignore_ascii_case("stream-one")
+            {
+                return Err(format!(
+                    "vless: unsupported xhttp mode '{mode}'; only 'stream-one' and 'auto' are supported"
+                ));
+            }
+            let extra_headers: Vec<(String, String)> = xhttp_opts
+                .and_then(|o| o.get("headers"))
+                .and_then(|h| h.as_mapping())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            let key = k.as_str()?.to_string();
+                            let val = v.as_str()?.to_string();
+                            Some((key, val))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let no_grpc_header = xhttp_opts
+                .and_then(|o| o.get("no-grpc-header"))
+                .and_then(serde_yaml::Value::as_bool)
+                .unwrap_or(false);
+            let x_padding_bytes =
+                if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
+                    if let Some(s) = padding_val.as_str() {
+                        let parts: Vec<&str> = s.split('-').collect();
+                        if parts.len() == 2 {
+                            let min = parts[0].trim().parse::<usize>().map_err(|e| {
+                                format!("vless: invalid min in x-padding-bytes '{s}': {e}")
+                            })?;
+                            let max = parts[1].trim().parse::<usize>().map_err(|e| {
+                                format!("vless: invalid max in x-padding-bytes '{s}': {e}")
+                            })?;
+                            if min > max {
+                                return Err(format!(
+                                    "vless: x-padding-bytes min ({min}) exceeds max ({max})"
+                                ));
+                            }
+                            Some((min, max))
+                        } else {
+                            return Err(format!(
+                                "vless: invalid x-padding-bytes range '{s}', expected 'min-max'"
+                            ));
+                        }
+                    } else if let Some(seq) = padding_val.as_sequence() {
+                        if seq.len() == 2 {
+                            let min = seq[0].as_u64().ok_or_else(|| {
+                                "vless: invalid min in x-padding-bytes".to_string()
+                            })? as usize;
+                            let max = seq[1].as_u64().ok_or_else(|| {
+                                "vless: invalid max in x-padding-bytes".to_string()
+                            })? as usize;
+                            if min > max {
+                                return Err(format!(
+                                    "vless: x-padding-bytes min ({min}) exceeds max ({max})"
+                                ));
+                            }
+                            Some((min, max))
+                        } else {
+                            return Err(
+                                "vless: x-padding-bytes array must have 2 elements".to_string()
+                            );
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    Some((100, 1000))
+                };
+            let xhttp_cfg = XhttpConfig {
+                path,
+                hosts,
+                extra_headers,
+                mode,
+                no_grpc_header,
+                x_padding_bytes,
+            };
+            chain.push(Box::new(XhttpLayer::new(xhttp_cfg)));
+        }
         other => {
             return Err(format!(
-                "vless: unsupported network '{other}'; valid values: tcp, ws, grpc, h2, httpupgrade"
+                "vless: unsupported network '{other}'; valid values: tcp, ws, grpc, h2, httpupgrade, xhttp"
             ));
         }
     }
@@ -1885,7 +1999,7 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
     }
     match network {
         "ws" => vec!["http/1.1".to_string()],
-        "grpc" | "h2" => vec!["h2".to_string()],
+        "grpc" | "h2" | "xhttp" => vec!["h2".to_string()],
         _ => alpn,
     }
 }
@@ -2500,6 +2614,10 @@ mod tests {
         );
         assert_eq!(
             default_transport_alpn("h2", Vec::new()),
+            vec!["h2".to_string()]
+        );
+        assert_eq!(
+            default_transport_alpn("xhttp", Vec::new()),
             vec!["h2".to_string()]
         );
         // Plain TCP keeps ALPN absent.

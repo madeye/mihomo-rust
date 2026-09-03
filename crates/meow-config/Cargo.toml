@@ -41,7 +41,7 @@ meow-trie = { workspace = true }
 meow-dns = { workspace = true, features = ["encrypted"] }
 meow-rules = { workspace = true }
 meow-proxy = { workspace = true, default-features = false }
-meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "httpupgrade"] }
+meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "httpupgrade", "xhttp"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

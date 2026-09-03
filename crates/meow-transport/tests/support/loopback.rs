@@ -312,14 +312,17 @@ async fn spawn_grpc_server_inner(
 
 // ─── HTTP/2 (plain) loopback server ──────────────────────────────────────────
 
-/// Metadata captured from a single h2 request received by the loopback server.
-#[cfg(feature = "h2")]
-#[derive(Debug)]
+#[cfg(any(feature = "h2", feature = "xhttp"))]
+#[derive(Debug, Clone)]
 pub struct H2ReqInfo {
+    /// The HTTP method sent by the client (e.g. `POST`).
+    pub method: String,
     /// The `:authority` pseudo-header sent by the client (e.g. `"example.com"`).
     pub authority: Option<String>,
     /// The `:path` pseudo-header sent by the client (e.g. `"/custom"`).
     pub path: String,
+    /// Request headers.
+    pub headers: http::HeaderMap,
 }
 
 /// Spawn a multi-accept plain-HTTP/2 loopback server.
@@ -336,7 +339,7 @@ pub struct H2ReqInfo {
 ///
 /// Using mpsc (not oneshot) allows multi-connection tests (e.g. D2 with 1000
 /// connections) to collect all metadata via a single receiver.
-#[cfg(feature = "h2")]
+#[cfg(any(feature = "h2", feature = "xhttp"))]
 pub async fn spawn_h2_server(
     max_connections: usize,
 ) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<H2ReqInfo>) {
@@ -347,14 +350,14 @@ pub async fn spawn_h2_server(
 /// client's first DATA frame arrives, the way mihomo's h2 handler behaves.
 /// A client that awaits the response inside `connect()` deadlocks here
 /// (issue #377).
-#[cfg(feature = "h2")]
+#[cfg(any(feature = "h2", feature = "xhttp"))]
 pub async fn spawn_h2_server_deferred_response(
     max_connections: usize,
 ) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<H2ReqInfo>) {
     spawn_h2_server_inner(max_connections, true).await
 }
 
-#[cfg(feature = "h2")]
+#[cfg(any(feature = "h2", feature = "xhttp"))]
 async fn spawn_h2_server_inner(
     max_connections: usize,
     defer_response: bool,
@@ -380,7 +383,7 @@ async fn spawn_h2_server_inner(
     (addr, rx)
 }
 
-#[cfg(feature = "h2")]
+#[cfg(any(feature = "h2", feature = "xhttp"))]
 async fn h2_handle_conn(
     tcp: tokio::net::TcpStream,
     tx: tokio::sync::mpsc::Sender<H2ReqInfo>,
@@ -396,13 +399,21 @@ async fn h2_handle_conn(
         return;
     };
 
+    let method = req.method().to_string();
     let authority = req.uri().authority().map(std::string::ToString::to_string);
     let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
 
     // Publish the request metadata as soon as the HEADERS arrive, so tests can
     // assert on it without depending on when the response is sent.
-    let _ = tx.send(H2ReqInfo { authority, path }).await;
-
+    let _ = tx
+        .send(H2ReqInfo {
+            method,
+            authority,
+            path,
+            headers,
+        })
+        .await;
     // Drive the h2 connection (SETTINGS, WINDOW_UPDATE, …) in background.
     tokio::spawn(async move { while conn.accept().await.is_some() {} });
 

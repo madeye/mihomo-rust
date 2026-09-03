@@ -514,4 +514,136 @@ mod vless_tests {
         // ProxyHealth must be accessible — no panic.
         let _health = adapter.health();
     }
+
+    // ─── H7: VLESS over XHTTP end-to-end round-trip ───────────────────────────
+
+    #[tokio::test]
+    async fn vless_over_xhttp_roundtrip() {
+        use bytes::Bytes;
+        use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
+
+        let (echo_addr, _echo) = start_tcp_echo_server().await;
+
+        // Start an H2 server that terminates the XHTTP tunnel and unwraps the inner VLESS stream.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_h2_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut connection) =
+                        h2::server::Builder::new().handshake::<_, Bytes>(tcp).await
+                    else {
+                        return;
+                    };
+
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        // Send 200 OK response header lazily to start the bidirectional stream
+                        let response = http::Response::builder().status(200).body(()).unwrap();
+                        let mut send_body = respond.send_response(response, false).unwrap();
+                        let mut recv_body = request.into_body();
+
+                        // Bridge the h2 stream into AsyncRead + AsyncWrite
+                        let (client_r, mut client_w) = tokio::io::duplex(64 * 1024);
+                        let (mut server_r, server_w) = tokio::io::duplex(64 * 1024);
+
+                        // Forward recv_body -> server_w
+                        tokio::spawn(async move {
+                            let mut server_w = server_w;
+                            while let Some(Ok(chunk)) = recv_body.data().await {
+                                let _ = recv_body.flow_control().release_capacity(chunk.len());
+                                if server_w.write_all(&chunk).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        // Forward client_r -> send_body
+                        tokio::spawn(async move {
+                            let mut client_r = client_r;
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                match client_r.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        send_body.reserve_capacity(n);
+                                        if send_body
+                                            .send_data(Bytes::copy_from_slice(&buf[..n]), false)
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        // Run mock VLESS server over server_r + client_w
+                        tokio::spawn(async move {
+                            let Ok((uuid, cmd, target_addr)) =
+                                read_vless_header(&mut server_r).await
+                            else {
+                                return;
+                            };
+                            if uuid != TEST_UUID {
+                                return;
+                            }
+                            if client_w.write_all(&[0x00, 0x00]).await.is_err() {
+                                return;
+                            }
+                            if cmd == 0x01 {
+                                if let Ok(mut target) = TcpStream::connect(target_addr).await {
+                                    let (mut tr, mut tw) = target.split();
+                                    let _ = tokio::join!(
+                                        tokio::io::copy(&mut server_r, &mut tw),
+                                        tokio::io::copy(&mut tr, &mut client_w)
+                                    );
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        // Build VlessAdapter with XhttpLayer in TransportChain
+        let mut chain = TransportChain::empty();
+        let xhttp_cfg = XhttpConfig {
+            path: "/xhttp-vless".into(),
+            hosts: vec!["xhttp.test.com".into()],
+            ..Default::default()
+        };
+        chain.push(Box::new(XhttpLayer::new(xhttp_cfg)));
+
+        let adapter = VlessAdapter::new(
+            "test-vless-xhttp",
+            "127.0.0.1",
+            vless_h2_addr.port(),
+            TEST_UUID,
+            None,
+            false,
+            chain,
+            Arc::new(DirectDialer),
+        );
+
+        let metadata = Metadata {
+            network: Network::Tcp,
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            dst_port: echo_addr.port(),
+            ..Default::default()
+        };
+
+        let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+            .await
+            .expect("dial_tcp timed out")
+            .expect("dial_tcp failed");
+
+        let payload = b"hello vless over xhttp";
+        conn.write_all(payload).await.expect("write payload failed");
+        conn.flush().await.expect("flush failed");
+
+        let mut buf = vec![0u8; payload.len()];
+        conn.read_exact(&mut buf).await.expect("read echo failed");
+        assert_eq!(&buf, payload, "round-trip data must match");
+    }
 }

@@ -145,6 +145,7 @@ pub struct H2Stream {
     pending_write: Option<Bytes>,
     remote_no_error_is_eof: bool,
     eos_sent: bool,
+    conn_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl H2Stream {
@@ -156,7 +157,13 @@ impl H2Stream {
             pending_write: None,
             remote_no_error_is_eof: false,
             eos_sent: false,
+            conn_abort: None,
         }
+    }
+
+    pub fn with_conn_abort(mut self, handle: tokio::task::AbortHandle) -> Self {
+        self.conn_abort = Some(handle);
+        self
     }
 
     pub fn with_remote_no_error_eof(mut self) -> Self {
@@ -186,6 +193,9 @@ impl H2Stream {
 impl Drop for H2Stream {
     fn drop(&mut self) {
         self.best_effort_eos();
+        if let Some(handle) = self.conn_abort.take() {
+            handle.abort();
+        }
     }
 }
 

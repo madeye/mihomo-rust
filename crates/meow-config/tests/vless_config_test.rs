@@ -1433,3 +1433,91 @@ proxies:
         "proxy with server > 255 bytes must be skipped (Class A)"
     );
 }
+
+// ─── XHTTP (SplitHTTP) transport config tests ────────────────────────────────
+
+#[tokio::test]
+async fn parse_vless_xhttp_minimal_ok() {
+    let yaml = r#"
+proxies:
+  - name: vless-xhttp
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: xhttp
+"#;
+    let config = load_config_from_str(yaml).await.expect("config must parse");
+    assert!(config.proxies.contains_key("vless-xhttp"));
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_full_opts_ok() {
+    let yaml = r#"
+proxies:
+  - name: vless-xhttp-full
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      path: /testpath
+      host: xhttp.example.com
+      mode: stream-one
+      no-grpc-header: true
+      x-padding-bytes: 200-800
+      headers:
+        X-Custom: Hello
+"#;
+    let config = load_config_from_str(yaml).await.expect("config must parse");
+    assert!(config.proxies.contains_key("vless-xhttp-full"));
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_unsupported_mode_skipped() {
+    let yaml = r#"
+proxies:
+  - name: vless-xhttp-bad-mode
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      mode: packet-up
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("config load must succeed (warn-and-skip)");
+    assert!(
+        !config.proxies.contains_key("vless-xhttp-bad-mode"),
+        "proxy with unsupported xhttp mode must be skipped"
+    );
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_invalid_padding_range_skipped() {
+    let yaml = r#"
+proxies:
+  - name: vless-xhttp-bad-pad
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      x-padding-bytes: 900-100
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("config load must succeed (warn-and-skip)");
+    assert!(
+        !config.proxies.contains_key("vless-xhttp-bad-pad"),
+        "proxy with inverted padding range must be skipped"
+    );
+}
