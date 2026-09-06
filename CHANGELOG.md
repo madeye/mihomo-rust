@@ -59,6 +59,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
+  the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.
+  The TProxy test image now includes the mandatory BoringSSL build toolchain.
 - Internal HTTP downloads strip authentication and cookie headers when a
   redirect changes origin, and reject bodies that do not match Content-Length
   before replacing provider caches.

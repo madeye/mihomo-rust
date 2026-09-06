@@ -117,6 +117,12 @@ fn write_server_files(dir: &Path, port: u16) -> PathBuf {
 }
 
 fn ensure_hysteria_binary(dir: &Path) -> Option<PathBuf> {
+    // Allow the same pinned release binary to be supplied locally when the
+    // Docker registry is unavailable. CI still uses IMAGE_HYSTERIA by default.
+    if let Some(path) = std::env::var_os("MEOW_HYSTERIA_BIN") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
     let bin = dir.join("hysteria");
     if bin.exists() {
         return Some(bin);
@@ -178,14 +184,14 @@ fn start_hysteria_server(port: u16) -> Option<HysteriaServer> {
         skip_or_panic("test requires Linux");
         return None;
     }
-    if !docker_available() {
+    if std::env::var_os("MEOW_HYSTERIA_BIN").is_none() && !docker_available() {
         skip_or_panic("docker daemon is not available");
         return None;
     }
 
     let dir = TempDir::new().unwrap();
     let Some(hysteria_bin) = ensure_hysteria_binary(dir.path()) else {
-        skip_or_panic("failed to extract hysteria server binary from docker image");
+        skip_or_panic("failed to locate hysteria server binary");
         return None;
     };
     let config_path = write_server_files(dir.path(), port);
@@ -204,7 +210,14 @@ fn start_hysteria_server(port: u16) -> Option<HysteriaServer> {
     // container environments (e.g. Gitpod).
     let stdout = log_file.try_clone().map_or(Stdio::null(), Stdio::from);
     let child = match Command::new(&hysteria_bin)
-        .args(["server", "-c", &config_path.to_string_lossy()])
+        .args([
+            "server",
+            "--disable-update-check",
+            "--log-level",
+            "debug",
+            "-c",
+            &config_path.to_string_lossy(),
+        ])
         .stdout(stdout)
         .stderr(Stdio::from(log_file))
         .spawn()
@@ -264,6 +277,7 @@ async fn start_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            tracing::debug!(bytes = n, "UDP echo target received packet");
             let _ = socket.send_to(&buf[..n], peer).await;
         }
     });
@@ -317,6 +331,10 @@ async fn dial_tcp_with_retry(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hysteria2_docker_tcp_and_udp_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let server_port = free_udp_port();
     let Some(server) = start_hysteria_server(server_port) else {
         return;
@@ -370,16 +388,23 @@ async fn hysteria2_docker_tcp_and_udp_round_trip() {
         .await
         .expect("udp associate timed out")
         .unwrap_or_else(|e| panic!("udp associate failed: {e}\n{}", server.logs()));
-    let udp_payload = b"meow hysteria2 udp";
-    timeout(T, packet_conn.write_packet(udp_payload, &udp_echo))
-        .await
-        .expect("udp write timed out")
-        .expect("udp write failed");
-    let mut udp_buf = [0u8; 1500];
-    let (n, src) = timeout(T, packet_conn.read_packet(&mut udp_buf))
-        .await
-        .expect("udp read timed out")
-        .expect("udp read failed");
-    assert_eq!(src, udp_echo);
-    assert_eq!(&udp_buf[..n], udp_payload);
+    // Exercise multiple packets: an accidental HTTP/3 datagram receiver can
+    // race the raw QUIC receiver and let a single packet pass by chance.
+    // Include payloads requiring fragmentation in both directions.
+    // v2.9.2 has a 4096-byte serialization buffer including the UDP header,
+    // so keep the payload below that while still requiring several fragments.
+    for (i, size) in [17, 64, 512, 4000].into_iter().cycle().take(12).enumerate() {
+        let udp_payload = vec![i as u8; size];
+        timeout(T, packet_conn.write_packet(&udp_payload, &udp_echo))
+            .await
+            .expect("udp write timed out")
+            .expect("udp write failed");
+        let mut udp_buf = [0u8; 4096];
+        let (n, src) = timeout(T, packet_conn.read_packet(&mut udp_buf))
+            .await
+            .unwrap_or_else(|e| panic!("udp read {i} timed out: {e}\n{}", server.logs()))
+            .expect("udp read failed");
+        assert_eq!(src, udp_echo);
+        assert_eq!(&udp_buf[..n], udp_payload);
+    }
 }

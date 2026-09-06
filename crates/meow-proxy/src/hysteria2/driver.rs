@@ -10,11 +10,11 @@
 //! consumer throttles the peer through QUIC flow control. `read_notify` wakes
 //! the driver when a handle drains its channel.
 
+use super::auth::Auth;
 use super::obfs::{HopState, Salamander};
 use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::{Config, Error, Result};
-use quiche::h3::NameValue as _;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,10 +263,8 @@ async fn run(
     ready_tx: oneshot::Sender<Result<bool>>,
 ) {
     let mut ready_tx = Some(ready_tx);
-    let mut h3: Option<quiche::h3::Connection> = None;
-    let mut auth_stream_id: Option<u64> = None;
+    let mut handshake: Option<Auth> = None;
     let mut auth_done = false;
-    let mut udp_enabled = false;
     let mut recv_buf = vec![0u8; 65535];
     let mut send_buf = vec![0u8; 1500];
     let mut keep_alive = tokio::time::interval_at(
@@ -293,7 +291,9 @@ async fn run(
                         if let Some(mut dgram) = deobfs(&st, &recv_buf[..n]) {
                             let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
                             let info = quiche::RecvInfo { from, to: st.local };
-                            let _ = conn.recv(&mut dgram, info);
+                            if let Err(e) = conn.recv(&mut dgram, info) {
+                                tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+                            }
                         }
                     }
                     Err(e) => { fail(&mut ready_tx, &mut st, Error::Io(e)); break; }
@@ -312,11 +312,10 @@ async fn run(
             }
         }
 
-        if conn.is_established() && h3.is_none() {
-            match start_auth(&mut conn, &auth) {
-                Ok((h3_conn, sid)) => {
-                    h3 = Some(h3_conn);
-                    auth_stream_id = Some(sid);
+        if conn.is_established() && handshake.is_none() && !auth_done {
+            match Auth::new(&auth.auth, auth.rx_bps) {
+                Ok(state) => {
+                    handshake = Some(state);
                 }
                 Err(e) => {
                     fail(&mut ready_tx, &mut st, e);
@@ -326,15 +325,15 @@ async fn run(
         }
 
         if !auth_done {
-            if let (Some(h3_conn), Some(sid)) = (h3.as_mut(), auth_stream_id) {
-                match drive_auth(&mut conn, h3_conn, sid, &mut udp_enabled) {
-                    Ok(true) => {
+            if let Some(handshake) = handshake.as_mut() {
+                match handshake.poll(&mut conn) {
+                    Ok(Some(enabled)) => {
                         auth_done = true;
                         if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(Ok(udp_enabled));
+                            let _ = tx.send(Ok(enabled));
                         }
                     }
-                    Ok(false) => {}
+                    Ok(None) => {}
                     Err(e) => {
                         fail(&mut ready_tx, &mut st, e);
                         break;
@@ -433,92 +432,6 @@ fn handle_cmd(st: &mut State, conn: &mut quiche::Connection, cmd: Cmd) {
             addr,
             data,
         } => send_udp(st, conn, session_id, &addr, &data),
-    }
-}
-
-/// Establish HTTP/3 and send the hysteria2 auth request. Returns the h3
-/// connection and the auth request's stream id.
-fn start_auth(
-    conn: &mut quiche::Connection,
-    auth: &AuthCtx,
-) -> Result<(quiche::h3::Connection, u64)> {
-    let h3_config =
-        quiche::h3::Config::new().map_err(|e| Error::Http3(format!("h3 config: {e}")))?;
-    let mut h3_conn = quiche::h3::Connection::with_transport(conn, &h3_config)
-        .map_err(|e| Error::Http3(format!("h3 with_transport: {e}")))?;
-    let padding = proto::auth_request_padding();
-    let rx = auth.rx_bps.to_string();
-    let headers = [
-        quiche::h3::Header::new(b":method", b"POST"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"hysteria"),
-        quiche::h3::Header::new(b":path", b"/auth"),
-        quiche::h3::Header::new(b"hysteria-auth", auth.auth.as_bytes()),
-        quiche::h3::Header::new(b"hysteria-cc-rx", rx.as_bytes()),
-        quiche::h3::Header::new(b"hysteria-padding", padding.as_bytes()),
-    ];
-    let sid = h3_conn
-        .send_request(conn, &headers, true)
-        .map_err(|e| Error::Http3(format!("auth send_request: {e}")))?;
-    Ok((h3_conn, sid))
-}
-
-/// Poll HTTP/3 for the auth response. `Ok(true)` once the auth stream
-/// finishes with status 233 (with `udp_enabled` populated across calls);
-/// `Ok(false)` while still pending. Headers and Finished can land in
-/// different polls, so `udp_enabled` must persist in the caller.
-fn drive_auth(
-    conn: &mut quiche::Connection,
-    h3: &mut quiche::h3::Connection,
-    auth_sid: u64,
-    udp_enabled: &mut bool,
-) -> Result<bool> {
-    let mut body = [0u8; 1024];
-    loop {
-        match h3.poll(conn) {
-            Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
-                if sid != auth_sid {
-                    continue;
-                }
-                let mut status = None;
-                for h in &list {
-                    match h.name() {
-                        b":status" => {
-                            status = std::str::from_utf8(h.value())
-                                .ok()
-                                .and_then(|v| v.parse::<u16>().ok());
-                        }
-                        b"hysteria-udp" => {
-                            *udp_enabled = matches!(
-                                std::str::from_utf8(h.value()).map(str::trim),
-                                Ok("true") | Ok("1") | Ok("yes") | Ok("True") | Ok("Yes")
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                if status != Some(233) {
-                    return Err(Error::Auth(format!(
-                        "authentication failed, status code: {}",
-                        status.map_or_else(|| "none".to_string(), |s| s.to_string())
-                    )));
-                }
-            }
-            Ok((_, quiche::h3::Event::Data)) => {
-                while h3.recv_body(conn, auth_sid, &mut body).unwrap_or(0) > 0 {}
-            }
-            Ok((sid, quiche::h3::Event::Finished)) => {
-                if sid == auth_sid {
-                    return Ok(true);
-                }
-            }
-            Ok((_, quiche::h3::Event::Reset(_))) => {
-                return Err(Error::Auth("auth stream reset by server".into()));
-            }
-            Ok(_) => {}
-            Err(quiche::h3::Error::Done) => return Ok(false),
-            Err(e) => return Err(Error::Http3(format!("auth poll: {e}"))),
-        }
     }
 }
 
@@ -683,8 +596,16 @@ fn flush_pending(s: &mut StreamState) -> bool {
 fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection) {
     let mut buf = [0u8; 65535];
     while let Ok(n) = conn.dgram_recv(&mut buf) {
+        tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
             Ok(msg) => {
+                tracing::trace!(
+                    session_id = msg.session_id,
+                    packet_id = msg.packet_id,
+                    frag_id = msg.frag_id,
+                    frag_count = msg.frag_count,
+                    "hysteria2 decoded UDP fragment"
+                );
                 if let Some(tx) = st.udp_sessions.get(&msg.session_id) {
                     let _ = tx.try_send(msg);
                 }
@@ -702,6 +623,12 @@ fn send_udp(
     data: &[u8],
 ) {
     let max = conn.dgram_max_writable_len().unwrap_or(0);
+    tracing::trace!(
+        session_id,
+        bytes = data.len(),
+        max,
+        "hysteria2 sending UDP packet"
+    );
     let Ok(header) = proto::udp_header_len(addr) else {
         return;
     };
@@ -747,7 +674,9 @@ fn send_udp(
 
 fn send_one_udp(conn: &mut quiche::Connection, msg: &UdpMessage) {
     if let Ok(encoded) = proto::encode_udp_message(msg) {
-        let _ = conn.dgram_send(&encoded);
+        if let Err(e) = conn.dgram_send(&encoded) {
+            tracing::debug!("hysteria2 could not queue UDP datagram: {e}");
+        }
     }
 }
 
@@ -794,6 +723,11 @@ async fn flush_send(
             Some(obfs) => obfs.encode(&out[..write]),
             None => out[..write].to_vec(),
         };
+        tracing::trace!(
+            bytes = payload.len(),
+            queued = conn.dgram_send_queue_len(),
+            "hysteria2 transmitting QUIC packet"
+        );
         st.socket.send_to(&payload, dest).await?;
     }
 }

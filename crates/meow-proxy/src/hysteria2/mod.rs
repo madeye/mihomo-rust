@@ -1,3 +1,4 @@
+mod auth;
 mod client;
 mod config;
 mod driver;

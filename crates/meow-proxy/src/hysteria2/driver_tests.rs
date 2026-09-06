@@ -7,6 +7,20 @@ use tokio::time::{sleep, timeout};
 const TARGET: &str = "target:80";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn raw_udp_round_trip_without_http3_datagrams() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(true);
+    let mut udp = timeout(TEST_TIMEOUT, client.udp()).await.unwrap().unwrap();
+    for size in [1, 64, 4096] {
+        let payload = vec![42; size];
+        udp.send(&payload, TARGET).unwrap();
+        let (received, addr) = timeout(TEST_TIMEOUT, udp.recv()).await.unwrap().unwrap();
+        assert_eq!(received, payload);
+        assert_eq!(addr, TARGET);
+    }
+}
+
 struct Peer {
     addr: SocketAddr,
     read_payload: Arc<AtomicBool>,
@@ -47,6 +61,10 @@ async fn peer(authenticate: bool, response: Option<u8>, stream_limit: u64) -> Pe
     config.set_initial_max_data(1 << 20);
     config.set_initial_max_stream_data_bidi_remote(64 * 1024);
     config.set_initial_max_stream_data_uni(64 * 1024);
+    config.enable_dgram(true, 64, 64);
+    // Echo complete client datagrams even when this peer's connection ID
+    // makes the outgoing packet header slightly larger than the incoming one.
+    config.set_max_send_udp_payload_size(1500);
     let read_payload = Arc::new(AtomicBool::new(true));
     let read_enabled = Arc::clone(&read_payload);
     let stop_writes = Arc::new(AtomicBool::new(false));
@@ -95,7 +113,7 @@ async fn peer(authenticate: bool, response: Option<u8>, stream_limit: u64) -> Pe
                                         id,
                                         &[
                                             quiche::h3::Header::new(b":status", b"233"),
-                                            quiche::h3::Header::new(b"hysteria-udp", b"false"),
+                                            quiche::h3::Header::new(b"hysteria-udp", b"true"),
                                         ],
                                         true,
                                     )
@@ -112,6 +130,14 @@ async fn peer(authenticate: bool, response: Option<u8>, stream_limit: u64) -> Pe
                 }
             }
             if authenticated {
+                // Hysteria uses raw QUIC datagrams. Advertising HTTP/3
+                // datagrams starts a competing receiver in quic-go.
+                if let Some(settings) = h3.as_ref().unwrap().peer_settings_raw() {
+                    assert!(!settings.iter().any(|&(id, value)| id == 0x33 && value == 1));
+                }
+                while let Ok(n) = conn.dgram_recv(&mut incoming) {
+                    conn.dgram_send(&incoming[..n]).unwrap();
+                }
                 if stop_requested.swap(false, Ordering::Relaxed) {
                     for &id in &established {
                         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 42);

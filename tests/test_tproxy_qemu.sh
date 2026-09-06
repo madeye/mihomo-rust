@@ -33,19 +33,21 @@ echo "=== Building test container ==="
 DOCKER_IMAGE="meow-tproxy-test"
 
 docker build -t "$DOCKER_IMAGE" -f - "$ROOT_DIR" <<'DOCKERFILE'
-FROM rust:1-alpine AS builder
-RUN apk add --no-cache musl-dev nftables bash busybox-extras
+FROM rust:1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang libclang-dev cmake git pkg-config
 WORKDIR /src
 COPY . .
-# tproxy tests don't need boring-tls or TUN. Default features pull boring-sys
-# (libclang dlopen, unsupported on musl-static). `full` now also pulls lwIP
-# (C + bindgen), same constraint. Enable the tproxy-relevant features only.
+# BoringSSL is mandatory, including for minimal TLS builds. Use a glibc
+# builder so bindgen can load libclang, and install its CMake/git toolchain.
+# TProxy does not need TUN/lwIP; retain the transport coverage without it.
 RUN cargo build -p meow-app --no-default-features \
     --features=ss,trojan,vless,vless-vision,vless-encryption,vmess,snell,hysteria2,anytls,ech-tls-tunnel,dns-server,dns-encrypted,listener-http,listener-socks5,listener-tproxy,listener-mixed \
     2>&1
 
-FROM alpine:latest
-RUN apk add --no-cache nftables bash busybox-extras
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nftables iproute2 netcat-traditional bash ca-certificates libstdc++6
 COPY --from=builder /src/target/debug/meow /usr/local/bin/meow
 COPY tests/tproxy-qemu/meow-tproxy.yaml /etc/meow-tproxy.yaml
 COPY tests/tproxy-qemu/guest-init.sh /run-tests.sh
