@@ -98,11 +98,14 @@ jobs:
         run: |
           cargo test --lib --bin meow \
             --test common_test \
+            --test socks5_udp_user \
             --test dns_cache_test \
             --test config_test \
             --test statistics_test \
             --test rules_test \
             --test api_test \
+            --test raii_guard_test \
+            --test http_connection_close \
             --test config_persistence_test \
             --test systemd_config_test \
             --test trojan_integration \
@@ -115,6 +118,9 @@ jobs:
             --test crate_invariants_test \
             --test crate_publish_metadata_test \
             -- --nocapture
+
+      - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
+        run: cargo test -p meow-listener --all-features --lib udp_port_53
 
       # ADR-0008 allocation-count gates. Release build: the thresholds are
       # calibrated against release codegen. The provider-backed pressure

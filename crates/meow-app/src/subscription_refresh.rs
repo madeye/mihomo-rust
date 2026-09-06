@@ -86,8 +86,7 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
 
                     match rebuild {
                         Ok(Ok((new_proxies, new_rules))) => {
-                            tunnel.update_proxies(new_proxies);
-                            tunnel.update_rules(new_rules);
+                            tunnel.update_routing(new_proxies, new_rules);
                             info!("Subscription '{}' refreshed successfully", name);
                             let _ =
                                 meow_config::save_raw_config_async(&config_path, &snapshot).await;

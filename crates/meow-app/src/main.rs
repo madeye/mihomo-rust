@@ -808,8 +808,7 @@ async fn run(
     // Create the tunnel (core routing engine)
     let tunnel = Tunnel::new(Arc::clone(&config.dns.resolver));
     tunnel.set_mode(config.general.mode);
-    tunnel.update_rules(config.rules);
-    tunnel.update_proxies(config.proxies);
+    tunnel.update_routing(config.proxies, config.rules);
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.

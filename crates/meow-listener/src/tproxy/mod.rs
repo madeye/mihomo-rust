@@ -3,8 +3,8 @@ mod orig_dest;
 
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
-use meow_common::{ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, ConnectionGuard, Tunnel, RELAY_BUF_SIZE};
+use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+use meow_tunnel::{copy_bidirectional_buf_tracked, Tunnel, RELAY_BUF_SIZE};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use std::future::Future;
@@ -323,6 +323,7 @@ async fn handle_tproxy_conn(
     );
 
     let inner = tunnel.inner();
+    let admission = inner.tcp_admission();
     let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy(&metadata) else {
         return Err("no matching rule".into());
     };
@@ -336,48 +337,53 @@ async fn handle_tproxy_conn(
         proxy.name()
     );
 
-    let _guard = ConnectionGuard::track(
-        &inner.stats,
+    let Some(_guard) = admission.track(
         metadata.pure(),
         rule_name,
         rule_payload,
         smallvec![Arc::from(proxy.name())],
-    );
+    ) else {
+        return Ok(());
+    };
 
     // Relay buffers on the future's stack — zero per-relay heap allocation (ADR-0011 T6).
     let mut relay_buf_up = [0u8; RELAY_BUF_SIZE];
     let mut relay_buf_dn = [0u8; RELAY_BUF_SIZE];
 
-    match proxy.dial_tcp(&metadata).await {
-        Ok(mut remote) => {
-            let up = Arc::clone(_guard.counters());
-            let dn = Arc::clone(_guard.counters());
-            match copy_bidirectional_buf_tracked(
-                &mut stream,
-                &mut remote,
-                &mut relay_buf_up,
-                &mut relay_buf_dn,
-                |n| {
-                    inner
-                        .stats
-                        .record_upload(&up, n as meow_common::atomic::Int);
-                },
-                |n| {
-                    inner
-                        .stats
-                        .record_download(&dn, n as meow_common::atomic::Int);
-                },
-            )
-            .await
-            {
-                Ok((up, down)) => {
-                    debug!("TProxy relay closed: up={up} down={down}");
+    _guard
+        .run_until_closed(async {
+            match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+                Ok(mut remote) => {
+                    let up = Arc::clone(_guard.counters());
+                    let dn = Arc::clone(_guard.counters());
+                    match copy_bidirectional_buf_tracked(
+                        &mut stream,
+                        &mut remote,
+                        &mut relay_buf_up,
+                        &mut relay_buf_dn,
+                        |n| {
+                            inner
+                                .stats
+                                .record_upload(&up, n as meow_common::atomic::Int);
+                        },
+                        |n| {
+                            inner
+                                .stats
+                                .record_download(&dn, n as meow_common::atomic::Int);
+                        },
+                    )
+                    .await
+                    {
+                        Ok((up, down)) => {
+                            debug!("TProxy relay closed: up={up} down={down}");
+                        }
+                        Err(e) => debug!("TProxy relay error: {e}"),
+                    }
                 }
-                Err(e) => debug!("TProxy relay error: {e}"),
+                Err(e) => warn!("TProxy dial error: {e}"),
             }
-        }
-        Err(e) => warn!("TProxy dial error: {e}"),
-    }
+        })
+        .await;
     // _guard drops here, removing the entry from Statistics.
     Ok(())
 }

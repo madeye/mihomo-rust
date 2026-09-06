@@ -1057,8 +1057,7 @@ async fn apply_raw_to_tunnel(
             format!("proxy group '{missing}' failed validation"),
         ));
     }
-    state.tunnel.update_proxies(proxies);
-    state.tunnel.update_rules(rules);
+    state.tunnel.update_routing(proxies, rules);
     Ok(())
 }
 
@@ -1931,23 +1930,18 @@ async fn put_configs(
         }
     };
 
-    // Cold reload: close all connections with structured log (Class A divergence from upstream)
-    let stats = state.tunnel.statistics();
-    let dropped = stats.active_connection_count();
-    stats.close_all_connections();
+    // Prepare routing before the synchronous admission/cancellation boundary.
+    // No old-policy setup can register after this cold reload completes.
+    let mode = raw_config
+        .mode
+        .as_deref()
+        .and_then(|mode| mode.parse().ok());
+    let dropped = state.tunnel.reload_routing(proxies, rules, mode);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
-            "connections force-closed after reload drain timeout"
+            "connection closure requested for cold reload"
         );
-    }
-
-    state.tunnel.update_proxies(proxies);
-    state.tunnel.update_rules(rules);
-    if let Some(mode_str) = &raw_config.mode {
-        if let Ok(mode) = mode_str.parse::<TunnelMode>() {
-            state.tunnel.set_mode(mode);
-        }
     }
 
     swap_config_and_reconcile_tun(&state, raw_config).await;

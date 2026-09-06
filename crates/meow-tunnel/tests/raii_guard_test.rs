@@ -157,3 +157,91 @@ async fn aborted_handle_tcp_does_not_leak_statistics_entry() {
     // Close the client side so the server task can clean up.
     let _ = _client_stream.shutdown().await;
 }
+
+#[tokio::test]
+async fn close_connection_cancels_pending_proxy_handshake() {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let tunnel = direct_tunnel();
+        let raw = meow_config::raw::RawConfig {
+            rules: Some(vec!["MATCH,REJECT-DROP".into()]),
+            ..Default::default()
+        };
+        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_proxies(proxies);
+        tunnel.update_rules(rules);
+        tunnel.set_mode(meow_common::TunnelMode::Rule);
+        let (server, mut client) = loopback_pair().await;
+        let inner = Arc::clone(tunnel.inner());
+        let task = tokio::spawn(async move {
+            handle_tcp(
+                &inner,
+                Box::new(server),
+                Metadata {
+                    network: Network::Tcp,
+                    dst_ip: Some("127.0.0.1".parse().unwrap()),
+                    dst_port: 12345,
+                    ..Default::default()
+                },
+            )
+            .await;
+        });
+        // REJECT-DROP's dial stalls for 60 s, keeping us in the dial phase.
+        while tunnel.statistics().active_connection_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished());
+        let id = tunnel.statistics().active_connections()[0].id;
+        tunnel.statistics().close_connection(id);
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        task.await.unwrap();
+    })
+    .await
+    .expect("close request failed to cancel pending dial");
+}
+
+#[tokio::test]
+async fn close_connection_cancels_blocked_prefix_write() {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let tunnel = direct_tunnel();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst = upstream.local_addr().unwrap();
+        let (mut server, mut client) = loopback_pair().await;
+        let inner = Arc::clone(tunnel.inner());
+        let task = tokio::spawn(async move {
+            // Larger than the loopback TCP buffers: the peer reads one byte,
+            // leaving write_all pending before the relay can start.
+            let prefix = vec![b'x'; 16 * 1024 * 1024];
+            meow_tunnel::route_inbound_tcp(
+                &inner,
+                &mut server,
+                Metadata {
+                    dst_ip: Some(dst.ip()),
+                    dst_port: dst.port(),
+                    ..Default::default()
+                },
+                &prefix,
+            )
+            .await;
+        });
+        let (mut remote, _) = upstream.accept().await.unwrap();
+        assert_eq!(remote.read_u8().await.unwrap(), b'x');
+        let info = tunnel.statistics().active_connections().pop().unwrap();
+        assert_eq!(
+            info.counters.upload_bytes(),
+            0,
+            "prefix write must still be pending"
+        );
+        tunnel.statistics().close_connection(info.id);
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        task.await.unwrap();
+        assert_eq!(
+            info.counters.upload_bytes(),
+            0,
+            "cancelled prefix must not complete"
+        );
+    })
+    .await
+    .expect("close request failed to cancel prefix write");
+}

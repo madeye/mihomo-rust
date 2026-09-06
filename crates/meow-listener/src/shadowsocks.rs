@@ -342,7 +342,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 // dropped, aborting its reply task and freeing the outbound conn.
 
 use meow_common::atomic::{AtomicU, Uint};
-use meow_common::{ProxyAdapter, ProxyPacketConn};
+use meow_common::{with_dial_timeout, ProxyPacketConn};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend};
 use std::collections::HashMap;
@@ -520,25 +520,16 @@ where
         return Ok(false);
     }
 
-    // Slow path: pick an outbound and dial. Port 53 bypasses to DIRECT,
-    // mirroring SOCKS5-UDP / meow_tunnel::udp (avoid looping client DNS).
-    let proxy: Arc<dyn ProxyAdapter> = if metadata.dst_port == 53 {
-        Arc::clone(&inner.direct) as Arc<dyn ProxyAdapter>
-    } else {
-        match inner.resolve_proxy(&metadata) {
-            Some((p, _rule, _payload)) => p,
-            None => {
-                return Err(format!(
-                    "no matching rule for {}",
-                    metadata.remote_address()
-                ))
-            }
-        }
+    // Client UDP follows the configured routing policy, including port 53.
+    let Some((proxy, _rule, _payload)) = inner.resolve_proxy(&metadata) else {
+        return Err(format!(
+            "no matching rule for {}",
+            metadata.remote_address()
+        ));
     };
 
     let conn: Arc<dyn ProxyPacketConn> = Arc::from(
-        proxy
-            .dial_udp(&metadata)
+        with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
             .await
             .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
     );
@@ -576,4 +567,49 @@ where
         },
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn udp_port_53_obeys_reject_rule() {
+        let tunnel = crate::test_rule_tunnel();
+        let config = shadowsocks::config::ServerConfig::new(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            "synthetic-test-password",
+            "aes-256-gcm".parse().unwrap(),
+        )
+        .unwrap();
+        let context =
+            shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+        let sock = Arc::new(
+            shadowsocks::ProxySocket::bind(context, &config)
+                .await
+                .unwrap(),
+        );
+        let mut flows = HashMap::new();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        for port in [53, 5353] {
+            let dst = SocketAddr::from(([127, 0, 0, 1], port));
+            assert!(handle_ss_udp_datagram(
+                &tunnel,
+                &sock,
+                &mut flows,
+                b"not a DNS query",
+                peer,
+                &Address::SocketAddress(dst),
+                "ss",
+                8388,
+                8,
+            )
+            .await
+            .unwrap());
+            assert!(
+                flows[&(peer, dst)].conn.local_addr().is_err(),
+                "must use REJECT, not DIRECT"
+            );
+        }
+    }
 }

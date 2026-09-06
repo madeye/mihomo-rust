@@ -43,3 +43,32 @@ pub use sniffer::SnifferRuntime;
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{TunListener, TunListenerConfig, TunReady, TunRouteScope};
+
+#[cfg(all(
+    test,
+    any(
+        feature = "listener-socks5",
+        feature = "listener-tun",
+        feature = "listener-shadowsocks"
+    )
+))]
+fn test_rule_tunnel() -> meow_tunnel::Tunnel {
+    let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        meow_trie::DomainTrie::new(),
+        false,
+        true,
+    ));
+    let tunnel = meow_tunnel::Tunnel::new(resolver);
+    tunnel.update_proxies(
+        meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .0,
+    );
+    tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+        "REJECT",
+    ))]);
+    tunnel
+}

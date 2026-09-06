@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -67,9 +67,28 @@ impl Default for RuleMatchCounters {
 pub struct ConnCounters {
     pub upload: AtomicI,
     pub download: AtomicI,
+    // Stored in the existing Arc so cancellation adds no setup allocation.
+    closed: AtomicBool,
+    close_notify: tokio::sync::Notify,
 }
 
 impl ConnCounters {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+    }
+
+    pub(crate) async fn closed(&self) {
+        // Register before checking the flag: closing before the first poll or
+        // between the check and await must not lose the wakeup.
+        let notified = self.close_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.closed.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
     pub fn upload_bytes(&self) -> Int {
         self.upload.load(Ordering::Relaxed)
     }
@@ -230,22 +249,37 @@ impl Statistics {
         rule_payload: SmolStr,
         chains: SmallVec<[Arc<str>; 1]>,
     ) -> Uuid {
+        self.track_connection_with_counters(metadata, rule, rule_payload, chains)
+            .0
+    }
+
+    pub(crate) fn track_connection_with_counters(
+        &self,
+        metadata: Metadata,
+        rule: SmolStr,
+        rule_payload: SmolStr,
+        chains: SmallVec<[Arc<str>; 1]>,
+    ) -> (Uuid, Arc<ConnCounters>) {
         let uuid = Uuid::new_v4();
+        let counters = Arc::new(ConnCounters::default());
         let info = ConnectionInfo {
             id: uuid,
             metadata: Arc::new(metadata),
-            counters: Arc::new(ConnCounters::default()),
+            counters: Arc::clone(&counters),
             start: chrono_now(),
             chains,
             rule,
             rule_payload,
         };
         self.connections.insert(uuid, info);
-        uuid
+        (uuid, counters)
     }
 
+    /// Signal the owner to drop its dial/relay future and remove the entry.
     pub fn close_connection(&self, id: Uuid) {
-        self.connections.remove(&id);
+        if let Some((_, info)) = self.connections.remove(&id) {
+            info.counters.close();
+        }
     }
 
     /// Live cumulative `(upload, download)` totals, read straight from the
@@ -278,7 +312,21 @@ impl Statistics {
     }
 
     pub fn close_all_connections(&self) {
-        self.connections.clear();
+        self.close_all_connections_counted();
+    }
+
+    /// Request closure of all tracked TCP connections and remove their entries.
+    /// Returns the number of closure requests, not completed socket teardowns.
+    pub fn close_all_connections_counted(&self) -> usize {
+        let mut closed = 0;
+        // Signal and remove under the same shard lock. A separate iteration
+        // followed by clear could erase newly inserted, unsignalled entries.
+        self.connections.retain(|_, info| {
+            info.counters.close();
+            closed += 1;
+            false
+        });
+        closed
     }
 }
 

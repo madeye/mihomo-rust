@@ -1,8 +1,7 @@
 use crate::tunnel::TunnelInner;
 use dashmap::DashMap;
-use meow_common::adapter::ProxyAdapter;
 use meow_common::atomic::AtomicU;
-use meow_common::{Metadata, ProxyPacketConn};
+use meow_common::{with_dial_timeout, Metadata, ProxyPacketConn};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -190,25 +189,10 @@ pub async fn handle_udp(
         return;
     }
 
-    // Slow path: new session — match rules and dial.
-    //
-    // UDP DNS bypass: any UDP packet destined for port 53 short-circuits
-    // rule matching and is dialled DIRECT. Routing client DNS through a
-    // proxy would defeat the whole point of the in-process DNS resolver
-    // (rule-set selection, fake-IP, snooping) and on Android would push
-    // queries through the VPN tun rather than over the protected fd.
-    let (proxy, rule_name, rule_payload) = if metadata.dst_port == 53 {
-        (
-            Arc::clone(&tunnel.direct) as Arc<dyn ProxyAdapter>,
-            smol_str::SmolStr::new_static("DnsBypass"),
-            smol_str::SmolStr::default(),
-        )
-    } else {
-        let Some(matched) = tunnel.resolve_proxy(&metadata) else {
-            warn!("no matching rule for UDP {}", metadata.remote_address());
-            return;
-        };
-        matched
+    // Slow path: all client UDP, including port 53, follows routing policy.
+    let Some((proxy, rule_name, rule_payload)) = tunnel.resolve_proxy(&metadata) else {
+        warn!("no matching rule for UDP {}", metadata.remote_address());
+        return;
     };
 
     info!(
@@ -220,7 +204,10 @@ pub async fn handle_udp(
         proxy.name()
     );
 
-    match proxy.dial_udp(&metadata).await {
+    // Bounded like mihomo's `C.DefaultUDPTimeout`. An unbounded dial here is
+    // worse than on TCP: the key is still unclaimed (see below), so every
+    // datagram of the flow starts its own stalled dial.
+    match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
         Ok(conn) => {
             let session = Arc::new(UdpSession::new(conn, Arc::from(proxy.name())));
             // Claim the key atomically before the first write. The dial above
@@ -273,6 +260,7 @@ mod tests {
     use super::*;
     use crate::tunnel::Tunnel;
     use async_trait::async_trait;
+    use meow_common::adapter::ProxyAdapter;
     use meow_common::error::Result as MeowResult;
     use meow_common::{
         AdapterType, DelayHistory, DnsMode, MeowError, Network, Proxy, ProxyConn, ProxyHealth,
@@ -303,6 +291,56 @@ mod tests {
             dst_ip: Some(dst.ip()),
             dst_port: dst.port(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_port_53_obeys_reject_rule() {
+        let tunnel = mk_tunnel();
+        tunnel.update_proxies(
+            meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .0,
+        );
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "REJECT",
+        ))]);
+        let src = "127.0.0.1:12345".parse().unwrap();
+        for port in [53, 5353] {
+            let dst = SocketAddr::from(([127, 0, 0, 1], port));
+            handle_udp(
+                tunnel.inner(),
+                b"not a DNS query",
+                src,
+                mk_metadata(src, dst),
+            )
+            .await;
+            let session = tunnel.inner().nat_table.get(&(src, dst)).unwrap();
+            assert_eq!(&*session.proxy_name, "REJECT");
+            assert!(
+                session.conn.local_addr().is_err(),
+                "must not open a DIRECT socket"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_port_53_obeys_proxy_rule_and_global_mode() {
+        for mode in [TunnelMode::Rule, TunnelMode::Global] {
+            let tunnel = mk_tunnel();
+            tunnel.set_mode(mode);
+            let proxy = Arc::new(SlowDialProxy::new());
+            let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+            proxies.insert("GLOBAL".into(), Arc::clone(&proxy) as Arc<dyn Proxy>);
+            tunnel.update_proxies(proxies);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "GLOBAL",
+            ))]);
+            let src = "127.0.0.1:12345".parse().unwrap();
+            let dst = "127.0.0.1:53".parse().unwrap();
+            handle_udp(tunnel.inner(), b"query", src, mk_metadata(src, dst)).await;
+            assert_eq!(proxy.dials.load(Ordering::SeqCst), 1);
+            assert_eq!(proxy.conns.lock().unwrap()[0].0.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -652,6 +690,85 @@ mod tests {
         assert!(
             current.is_some_and(|s| Arc::ptr_eq(&s, &replacement)),
             "the fresh replacement session must survive the failed session's eviction"
+        );
+    }
+
+    /// A proxy whose dial never resolves — a server that completes the TCP/QUIC
+    /// handshake and then goes silent mid-protocol.
+    struct StalledDialProxy {
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for StalledDialProxy {
+        fn name(&self) -> &str {
+            "stalled-mock"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            std::future::pending().await
+        }
+        async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            std::future::pending().await
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for StalledDialProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A dial that never completes must not park the caller forever. Without
+    /// the `DIAL_TIMEOUT` bound this test hangs: every datagram of the flow
+    /// spawns another immortal task, since the NAT key is only claimed after
+    /// the dial returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_dial_gives_up_instead_of_parking_the_flow() {
+        let tunnel = mk_tunnel();
+        tunnel.set_mode(TunnelMode::Global);
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::new_static("GLOBAL"),
+            Arc::new(StalledDialProxy {
+                health: ProxyHealth::new(),
+            }) as Arc<dyn Proxy>,
+        );
+        tunnel.update_proxies(proxies);
+
+        let src = SocketAddr::from(([127, 0, 0, 1], 8888));
+        let dst = SocketAddr::from(([198, 51, 100, 10], 443));
+
+        let start = tokio::time::Instant::now();
+        handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
+
+        assert_eq!(start.elapsed(), meow_common::DIAL_TIMEOUT);
+        assert!(
+            tunnel.inner().nat_table.is_empty(),
+            "a dial that never completed must not leave a session behind"
         );
     }
 }

@@ -152,6 +152,56 @@ pub(super) fn record_dial_failure(
     }
 }
 
+/// Tracks the selected member even when an outer dial deadline drops the
+/// group future before its error arm can run. Capturing the deadline avoids
+/// consulting task-local state during destruction. Ordinary cancellation
+/// before expiry is not a node failure, and completed dials are counted once.
+struct DialAttempt<'a> {
+    group_name: &'a str,
+    tracker: &'a DialFailureTracker,
+    member: &'a Arc<dyn Proxy>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl<'a> DialAttempt<'a> {
+    fn new(
+        group_name: &'a str,
+        tracker: &'a DialFailureTracker,
+        member: &'a Arc<dyn Proxy>,
+    ) -> Self {
+        Self {
+            group_name,
+            tracker,
+            member,
+            deadline: meow_common::dial::dial_deadline(),
+        }
+    }
+
+    fn finish<T>(mut self, result: meow_common::Result<T>) -> meow_common::Result<T> {
+        self.deadline = None;
+        match &result {
+            Ok(_) => self.tracker.on_success(),
+            Err(err) => record_dial_failure(self.group_name, self.tracker, self.member, err),
+        }
+        result
+    }
+}
+
+impl Drop for DialAttempt<'_> {
+    fn drop(&mut self) {
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            let err = MeowError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "outbound dial deadline elapsed",
+            ));
+            record_dial_failure(self.group_name, self.tracker, self.member, &err);
+        }
+    }
+}
+
 pub mod dialer_proxy;
 pub mod fallback;
 pub mod load_balance;
@@ -260,3 +310,6 @@ mod tests {
         assert!(tracker.on_failure(&io_err("dial timed out")));
     }
 }
+
+#[cfg(test)]
+mod dial_timeout_tests;

@@ -1,6 +1,6 @@
 //! Session implementation for AnyTLS protocol
 
-use crate::padding::PaddingFactory;
+use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::protocol::{Command, Frame, FrameCodec};
 use crate::session::Stream;
 use crate::session::writer::{StreamWriter, WriteRequest};
@@ -56,8 +56,9 @@ pub struct Session {
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
 
-    // Padding factory (wrapped in Arc for potential updates)
-    padding: Arc<RwLock<Arc<PaddingFactory>>>,
+    // Padding factory in force for this session. Client sessions share the
+    // client's cell, so a server-pushed scheme reaches sessions opened later.
+    padding: SharedPaddingFactory,
 
     // Client/Server specific
     is_client: bool,
@@ -109,7 +110,7 @@ impl Session {
     pub fn new_client<R, W>(
         reader: R,
         writer: W,
-        padding: Arc<PaddingFactory>,
+        padding: SharedPaddingFactory,
         heartbeat: Option<SessionHeartbeatConfig>,
     ) -> Self
     where
@@ -142,7 +143,7 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            padding: Arc::new(RwLock::new(padding)),
+            padding,
             is_client: true,
             send_padding: true,
             pkt_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -182,7 +183,7 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            padding: Arc::new(RwLock::new(padding)),
+            padding: padding.into_shared(),
             is_client: false,
             send_padding: false,
             pkt_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -700,22 +701,26 @@ impl Session {
                 }
             }
             Command::UpdatePaddingScheme => {
-                // Server updates padding scheme (client side)
+                // Server updates padding scheme (client side). The new factory
+                // goes into the shared cell, so this session switches scheme
+                // mid-flight and later sessions of the same client advertise
+                // the new md5 instead of provoking another update frame.
                 if self.is_client && !frame.data.is_empty() {
-                    let raw_scheme = frame.data.as_ref();
-                    match PaddingFactory::update_default(raw_scheme) {
-                        Ok(_) => {
-                            let md5_hash = md5::compute(raw_scheme);
-                            tracing::info!("[Session] Padding scheme updated: {:x}", md5_hash);
-                            // Update the session's padding factory
-                            let mut padding_guard = self.padding.write().await;
-                            *padding_guard = PaddingFactory::default();
+                    match PaddingFactory::new(&frame.data) {
+                        Ok(factory) => {
+                            let factory = Arc::new(factory);
+                            tracing::debug!(
+                                session_id = self.id,
+                                "[Session] Padding scheme updated: {}",
+                                factory.md5()
+                            );
+                            *self.padding.write().await = factory;
                         }
                         Err(e) => {
-                            let md5_hash = md5::compute(raw_scheme);
                             tracing::warn!(
+                                session_id = self.id,
                                 "[Session] Failed to update padding scheme {:x}: {}",
-                                md5_hash,
+                                md5::compute(&frame.data),
                                 e
                             );
                         }
@@ -1550,7 +1555,7 @@ mod tests {
         let client_session = Arc::new(Session::new_client(
             client_read,
             client_write,
-            padding.clone(),
+            Arc::clone(&padding).into_shared(),
             None,
         ));
 
@@ -1617,7 +1622,7 @@ mod tests {
         let client_session = Arc::new(Session::new_client(
             client_read,
             client_write,
-            padding.clone(),
+            Arc::clone(&padding).into_shared(),
             None,
         ));
 
@@ -1681,7 +1686,12 @@ mod tests {
 
         let padding = create_test_padding();
 
-        let session1 = Arc::new(Session::new_client(read1, write1, padding.clone(), None));
+        let session1 = Arc::new(Session::new_client(
+            read1,
+            write1,
+            Arc::clone(&padding).into_shared(),
+            None,
+        ));
 
         let session2 = Arc::new(Session::new_server(read2, write2, padding));
 
@@ -1724,5 +1734,160 @@ mod tests {
         assert!(!session2.is_closed());
 
         tracing::debug!("Bidirectional heartbeat test passed");
+    }
+
+    /// A pushed scheme must reach the live session *and* the client's shared
+    /// cell — the global `OnceLock` this used to write could only ever be set
+    /// once, so every push after the first session was silently dropped.
+    #[tokio::test]
+    async fn server_pushed_padding_scheme_replaces_the_shared_factory() {
+        const SCHEME: &str = "stop=2\n0=50-50\n1=100-200";
+
+        let padding = create_test_padding().into_shared();
+        let before = padding.read().await.md5().to_string();
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::clone(&padding),
+            None,
+        ));
+
+        session
+            .handle_frame(Frame::with_data(
+                Command::UpdatePaddingScheme,
+                0,
+                Bytes::from_static(SCHEME.as_bytes()),
+            ))
+            .await
+            .unwrap();
+
+        let pushed = PaddingFactory::new(SCHEME.as_bytes()).unwrap();
+        assert_ne!(before, pushed.md5());
+        // The live session pads with the pushed scheme…
+        assert_eq!(session.padding.read().await.md5(), pushed.md5());
+        assert_eq!(
+            session
+                .padding
+                .read()
+                .await
+                .generate_record_payload_sizes(0),
+            vec![50]
+        );
+        // …and so does the cell, so the next session advertises the new md5
+        // instead of provoking another update frame.
+        assert_eq!(padding.read().await.md5(), pushed.md5());
+    }
+
+    /// An unparsable scheme leaves the previous one in force.
+    #[tokio::test]
+    async fn invalid_pushed_padding_scheme_keeps_the_previous_factory() {
+        let padding = create_test_padding().into_shared();
+        let before = padding.read().await.md5().to_string();
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::clone(&padding),
+            None,
+        ));
+
+        session
+            .handle_frame(Frame::with_data(
+                Command::UpdatePaddingScheme,
+                0,
+                Bytes::from_static(b"0=30-30"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(padding.read().await.md5(), before);
+        assert_eq!(session.padding.read().await.md5(), before);
+    }
+
+    /// Server sessions never apply a pushed scheme.
+    #[tokio::test]
+    async fn server_session_ignores_padding_scheme_updates() {
+        let session = Arc::new(Session::new_server(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            create_test_padding(),
+        ));
+        let before = session.padding.read().await.md5().to_string();
+
+        session
+            .handle_frame(Frame::with_data(
+                Command::UpdatePaddingScheme,
+                0,
+                Bytes::from_static(b"stop=2\n0=50-50"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(session.padding.read().await.md5(), before);
+    }
+}
+#[cfg(test)]
+mod padding_bounds_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maximum_padding_keeps_the_next_frame_aligned() {
+        use tokio::io::AsyncReadExt;
+        let (writer, mut reader) = tokio::io::duplex(2 * u16::MAX as usize);
+        let padding =
+            Arc::new(PaddingFactory::new(b"stop=2\n1=65535-65535").unwrap()).into_shared();
+        let session = Session::new_client(tokio::io::empty(), writer, padding, None);
+        session
+            .pkt_counter
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        session.write_with_padding(BytesMut::new()).await.unwrap();
+        // The next unpadded frame must start after the declared Waste payload,
+        // even at the largest representable length.
+        let next = [Command::Waste as u8, 0, 0, 0, 0, 0, 0];
+        session
+            .write_with_padding(BytesMut::from(next.as_slice()))
+            .await
+            .unwrap();
+        let mut header = [0u8; 7];
+        reader.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [Command::Waste as u8, 0, 0, 0, 0, 255, 255]);
+        let mut payload = vec![1u8; u16::MAX as usize];
+        reader.read_exact(&mut payload).await.unwrap();
+        assert!(payload.iter().all(|b| *b == 0));
+        reader.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, next);
+    }
+
+    #[tokio::test]
+    async fn oversized_pushed_scheme_is_rejected_before_the_next_write() {
+        let padding = PaddingFactory::default().into_shared();
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::clone(&padding),
+            None,
+        ));
+        // A short, otherwise well-formed UpdatePaddingScheme received before
+        // packet 1. No large allocation is performed by this probe.
+        session
+            .pkt_counter
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        session
+            .handle_frame(Frame::with_data(
+                Command::UpdatePaddingScheme,
+                0,
+                Bytes::from_static(b"stop=2\n1=2147483648-2147483648"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(padding.read().await.md5(), PaddingFactory::default().md5());
+        let result = tokio::spawn(async move {
+            session
+                .write_with_padding(BytesMut::from(&b"payload"[..]))
+                .await
+        })
+        .await;
+        result
+            .expect("server-pushed padding must not panic")
+            .unwrap();
     }
 }

@@ -1,6 +1,8 @@
 use crate::padding::CHECK_MARK;
 use crate::util::StringMap;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Default padding scheme
 pub const DEFAULT_PADDING_SCHEME: &str = r#"stop=8
@@ -16,14 +18,36 @@ pub const DEFAULT_PADDING_SCHEME: &str = r#"stop=8
 /// PaddingFactory generates padding sizes according to the scheme
 #[derive(Debug, Clone)]
 pub struct PaddingFactory {
-    scheme: StringMap,
+    sizes: HashMap<String, Vec<PaddingSize>>,
     raw_scheme: Vec<u8>,
     stop: u32,
     md5: String,
 }
 
-/// Global padding factory
+// Authentication and Waste frames encode lengths as u16. Bound the aggregate
+// too: a short peer-supplied scheme must not expand one write without limit.
+const MAX_PACKET_PADDING: usize = 1024 * 1024;
+
+#[derive(Debug, Clone)]
+enum PaddingSize {
+    Check,
+    Range(u16, u16),
+}
+
+/// The built-in default scheme, parsed once. Immutable: a scheme pushed by one
+/// server must not leak into sessions of another, so runtime updates go to the
+/// per-client `SharedPaddingFactory` cell instead.
 static DEFAULT_FACTORY: std::sync::OnceLock<Arc<PaddingFactory>> = std::sync::OnceLock::new();
+
+/// A padding factory that the peer can replace while a session is running.
+///
+/// An AnyTLS server answers any session whose advertised `padding-md5` differs
+/// from its own scheme with an `UpdatePaddingScheme` frame. One cell is shared
+/// by a client and every session it opens, so a pushed scheme applies to the
+/// live session and to sessions opened later — the same ownership anytls-go
+/// gets from handing its sessions the client's
+/// `atomic.TypedValue[*padding.PaddingFactory]`.
+pub type SharedPaddingFactory = Arc<RwLock<Arc<PaddingFactory>>>;
 
 impl PaddingFactory {
     /// Create a new PaddingFactory from raw scheme bytes
@@ -36,11 +60,46 @@ impl PaddingFactory {
             .parse::<u32>()
             .map_err(|_| "invalid 'stop' value".to_string())?;
 
+        let mut sizes = HashMap::new();
+        for (key, spec) in scheme.iter() {
+            if key.parse::<u32>().is_err() {
+                continue;
+            }
+            let mut packet_sizes = Vec::new();
+            let mut total = 0usize;
+            for part in spec.split(',').map(str::trim) {
+                if part == "c" {
+                    packet_sizes.push(PaddingSize::Check);
+                    continue;
+                }
+                let (min, max) = part
+                    .split_once('-')
+                    .ok_or_else(|| "invalid padding range".to_string())?;
+                let parse_size = |value: &str| {
+                    value
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| "padding size must be between 1 and 65535".to_string())
+                };
+                let (min, max) = (parse_size(min)?, parse_size(max)?);
+                let (min, max) = (min.min(max), min.max(max));
+                // Each size can produce a Waste frame as well as its payload.
+                total += usize::from(max) + crate::protocol::HEADER_OVERHEAD_SIZE;
+                if total > MAX_PACKET_PADDING {
+                    return Err("padding for one packet exceeds 1 MiB".to_string());
+                }
+                packet_sizes.push(PaddingSize::Range(min, max));
+            }
+            sizes.insert(key.clone(), packet_sizes);
+        }
+
         let md5_hash = md5::compute(raw_scheme);
         let md5 = format!("{:x}", md5_hash);
 
         Ok(Self {
-            scheme,
+            sizes,
             raw_scheme: raw_scheme.to_vec(),
             stop,
             md5,
@@ -63,12 +122,9 @@ impl PaddingFactory {
             .clone()
     }
 
-    /// Update the default padding factory
-    pub fn update_default(raw_scheme: &[u8]) -> Result<(), String> {
-        let factory = Arc::new(Self::new(raw_scheme)?);
-        DEFAULT_FACTORY
-            .set(factory)
-            .map_err(|_| "failed to update default factory".to_string())
+    /// Wrap this factory in a cell that a client and its sessions share.
+    pub fn into_shared(self: Arc<Self>) -> SharedPaddingFactory {
+        Arc::new(RwLock::new(self))
     }
 
     /// Get the stop value
@@ -90,40 +146,16 @@ impl PaddingFactory {
     /// Returns a vector of sizes, where CHECK_MARK (-1) indicates a check point
     pub fn generate_record_payload_sizes(&self, pkt: u32) -> Vec<i32> {
         let key = pkt.to_string();
-        let Some(spec) = self.scheme.get(&key) else {
+        let Some(spec) = self.sizes.get(&key) else {
             return Vec::new();
         };
-
-        let mut sizes = Vec::new();
-        let parts: Vec<&str> = spec.split(',').collect();
-
-        for part in parts {
-            let part = part.trim();
-            if part == "c" {
-                sizes.push(CHECK_MARK);
-                continue;
-            }
-
-            if let Some((min_str, max_str)) = part.split_once('-') {
-                let min_val = min_str.trim().parse::<i64>().unwrap_or(0);
-                let max_val = max_str.trim().parse::<i64>().unwrap_or(0);
-
-                if min_val <= 0 || max_val <= 0 {
-                    continue;
-                }
-
-                let (min_val, max_val) = (min_val.min(max_val), min_val.max(max_val));
-
-                if min_val == max_val {
-                    sizes.push(min_val as i32);
-                } else {
-                    let size = rand::random_range(min_val..=max_val);
-                    sizes.push(size as i32);
-                }
-            }
-        }
-
-        sizes
+        spec.iter()
+            .map(|size| match *size {
+                PaddingSize::Check => CHECK_MARK,
+                PaddingSize::Range(min, max) if min == max => i32::from(min),
+                PaddingSize::Range(min, max) => i32::from(rand::random_range(min..=max)),
+            })
+            .collect()
     }
 }
 
@@ -163,6 +195,40 @@ mod tests {
         assert!(sizes[0] >= 400 && sizes[0] <= 500);
         assert_eq!(sizes[1], CHECK_MARK);
         assert!(sizes[2] >= 500 && sizes[2] <= 1000);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_or_malformed_sizes() {
+        for range in [
+            "2147483648-2147483648",
+            "65536-65536",
+            "1-65536",
+            "-1-30",
+            "0-30",
+            "30",
+            "x-30",
+        ] {
+            for packet in [0, 1] {
+                let scheme = format!("stop=2\n{packet}={range}");
+                assert!(PaddingFactory::new(scheme.as_bytes()).is_err(), "{scheme}");
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_wire_boundary_reversed_ranges_and_checkpoints() {
+        let factory = PaddingFactory::new(b"stop=2\n0=65535-65535\n1=2-1,c,9-9").unwrap();
+        assert_eq!(factory.generate_record_payload_sizes(0), vec![65535]);
+        let sizes = factory.generate_record_payload_sizes(1);
+        assert!((1..=2).contains(&sizes[0]));
+        assert_eq!(&sizes[1..], &[CHECK_MARK, 9]);
+    }
+
+    #[test]
+    fn bounds_total_padding_per_packet() {
+        let sizes = ["65535-65535"; 17].join(",");
+        let scheme = format!("stop=2\n1={sizes}");
+        assert!(PaddingFactory::new(scheme.as_bytes()).is_err());
     }
 
     #[test]

@@ -38,6 +38,17 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
+    fn new(proxies: HashMap<SmolStr, Arc<dyn Proxy>>, rules: Vec<Box<dyn Rule>>) -> Self {
+        let domain_index = DomainIndex::build(&rules);
+        let compiled_rules = CompiledRuleSet::build(&rules);
+        Self {
+            rules: Arc::new(rules),
+            domain_index: Arc::new(domain_index),
+            compiled_rules: Arc::new(compiled_rules),
+            proxies,
+        }
+    }
+
     fn empty() -> Self {
         Self {
             rules: Arc::new(Vec::new()),
@@ -61,6 +72,11 @@ pub struct TunnelInner {
     pub direct: Arc<DirectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
+    /// Cold-reload admission boundary. TCP setup captures this generation
+    /// before routing, then checks it under a read lock through registration.
+    /// Reload holds the write lock through cancellation and route publication.
+    /// Neither side holds this lock across an await or during relay.
+    pub(crate) tcp_generation: RwLock<u64>,
     /// Cached: true if any rule needs the dst_ip resolved (GeoIP / IP-CIDR).
     /// Recomputed by `Tunnel::update_rules`.
     pub needs_ip_resolution: AtomicBool,
@@ -174,7 +190,7 @@ impl TunnelInner {
                 // One route-table snapshot — rules + index + proxies all read
                 // from a consistent table. Replaces three RwLock acquisitions.
                 let route = self.route();
-                let needs_proc = self.needs_process_lookup.load(Ordering::Relaxed);
+                let needs_proc = route.compiled_rules.needs_process_lookup();
                 let enriched = if needs_proc {
                     match_engine::maybe_enrich_with_process(metadata)
                 } else {
@@ -310,6 +326,7 @@ impl Tunnel {
                 direct,
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
+                tcp_generation: RwLock::new(0),
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
@@ -381,6 +398,59 @@ impl Tunnel {
             *route = Arc::new(new_route);
         }
         info!("Proxies updated");
+    }
+
+    /// Publish a complete rules/proxies snapshot, preserving active TCP flows.
+    /// Use this instead of successive partial updates for a config rebuild.
+    pub fn update_routing(
+        &self,
+        proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+        rules: Vec<Box<dyn Rule>>,
+    ) {
+        drop(self.install_routing(Arc::new(RouteTable::new(proxies, rules))));
+        info!("Routing configuration updated");
+    }
+
+    /// Immediately cancel tracked TCP flows and publish new routing state.
+    ///
+    /// Compilation finishes before admission is locked. Registration either
+    /// precedes cancellation, or detects the changed generation and refuses
+    /// the old routing decision (including a decision delayed by DNS). New
+    /// setup can capture the new generation only after publication completes.
+    /// Returns closure requests for tracked TCP flows, not completed teardowns;
+    /// unregistered setups are rejected later and UDP sessions are unaffected.
+    pub fn reload_routing(
+        &self,
+        proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+        rules: Vec<Box<dyn Rule>>,
+        mode: Option<TunnelMode>,
+    ) -> usize {
+        let route = Arc::new(RouteTable::new(proxies, rules));
+        let mut generation = self.inner.tcp_generation.write();
+        *generation = generation.checked_add(1).expect("TCP generation exhausted");
+        let closed = self.inner.stats.close_all_connections_counted();
+        let old = self.install_routing(route);
+        if let Some(mode) = mode {
+            self.set_mode(mode);
+        }
+        drop(generation);
+        // Releasing a large old rule set must not hold up TCP admission.
+        drop(old);
+        info!("Routing configuration reloaded");
+        closed
+    }
+
+    fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
+        let needs_ip = route.compiled_rules.needs_ip_resolution();
+        let needs_process = route.compiled_rules.needs_process_lookup();
+        let mut current = self.inner.route.write();
+        self.inner
+            .needs_ip_resolution
+            .store(needs_ip, Ordering::Relaxed);
+        self.inner
+            .needs_process_lookup
+            .store(needs_process, Ordering::Relaxed);
+        std::mem::replace(&mut *current, route)
     }
 
     pub fn statistics(&self) -> &Arc<Statistics> {
@@ -466,7 +536,7 @@ impl Clone for Tunnel {
 }
 
 #[cfg(test)]
-mod tun_handle_tests {
+mod tests {
     use super::*;
     use meow_common::DnsMode;
     use meow_dns::Resolver;
@@ -482,6 +552,88 @@ mod tun_handle_tests {
             true,
         ));
         Tunnel::new(resolver)
+    }
+
+    #[test]
+    fn routing_rebuild_keeps_old_snapshot_until_candidate_is_ready() {
+        use meow_common::{RuleMatchHelper, RuleType};
+        use std::sync::mpsc::{self, Receiver, SyncSender};
+        use std::time::Duration;
+
+        // Pause real rule compilation, after the caller has supplied both
+        // the replacement proxies and rules. A split publication exposes
+        // new proxies with old rules during precisely this interval.
+        struct PausedRule(parking_lot::Mutex<Option<(SyncSender<()>, Receiver<()>)>>);
+        impl Rule for PausedRule {
+            fn rule_type(&self) -> RuleType {
+                RuleType::Match
+            }
+            fn match_metadata(&self, _: &Metadata, _: &RuleMatchHelper) -> bool {
+                true
+            }
+            fn adapter(&self) -> &str {
+                "NEW"
+            }
+            fn payload(&self) -> &str {
+                if let Some((entered, resume)) = self.0.lock().take() {
+                    entered.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                ""
+            }
+        }
+
+        for cold in [false, true] {
+            let tunnel = test_tunnel();
+            let proxy = meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .0
+                .remove("DIRECT")
+                .unwrap();
+            tunnel.update_routing(
+                HashMap::from([("OLD".into(), Arc::clone(&proxy))]),
+                vec![Box::new(meow_rules::final_rule::FinalRule::new("OLD"))],
+            );
+            let stats = tunnel.statistics();
+            let id = stats.track_connection(
+                Metadata::default(),
+                "MATCH".into(),
+                "".into(),
+                smallvec::smallvec![],
+            );
+            let old = tunnel.route_snapshot();
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+            let candidate: Vec<Box<dyn Rule>> = vec![Box::new(PausedRule(
+                parking_lot::Mutex::new(Some((entered_tx, resume_rx))),
+            ))];
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let proxies = HashMap::from([("NEW".into(), proxy)]);
+                    if cold {
+                        assert_eq!(tunnel.reload_routing(proxies, candidate, None), 1);
+                    } else {
+                        tunnel.update_routing(proxies, candidate);
+                    }
+                });
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let during_build = tunnel.route_snapshot();
+                let still_tracked = stats.active_connection_count();
+                // Release the compiler before asserting, including failure paths.
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap();
+                assert!(Arc::ptr_eq(&old, &during_build));
+                assert_eq!(still_tracked, 1, "compilation must precede cancellation");
+            });
+            let new = tunnel.route_snapshot();
+            assert_eq!(new.rules[0].adapter(), "NEW");
+            assert!(new.proxies.contains_key("NEW"));
+            assert!(!new.proxies.contains_key("OLD"));
+            assert_eq!(old.rules[0].adapter(), "OLD");
+            assert!(old.proxies.contains_key("OLD"));
+            assert_eq!(stats.active_connection_count(), usize::from(!cold));
+            stats.close_connection(id);
+        }
     }
 
     /// Sends on drop, so a test can observe that an aborted listener task

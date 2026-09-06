@@ -133,14 +133,17 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo test -p meow-listener --all-features --lib udp_port_53
 
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
 # lands `main` red.
 cargo test --lib --bin meow \
+  --test socks5_udp_user \
   --test common_test --test dns_cache_test --test config_test \
   --test statistics_test --test rules_test --test api_test \
+  --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test pre_resolve_test \

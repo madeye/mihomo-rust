@@ -169,16 +169,8 @@ impl ProxyAdapter for FallbackGroup {
         let proxy = self
             .first_alive()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        match proxy.dial_tcp(metadata).await {
-            Ok(conn) => {
-                self.dial_failures.on_success();
-                Ok(conn)
-            }
-            Err(err) => {
-                super::record_dial_failure(&self.name, &self.dial_failures, &proxy, &err);
-                Err(err)
-            }
-        }
+        let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
+        attempt.finish(proxy.dial_tcp(metadata).await)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -186,16 +178,8 @@ impl ProxyAdapter for FallbackGroup {
         let proxy = self
             .first_alive()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
-        match proxy.dial_udp(metadata).await {
-            Ok(conn) => {
-                self.dial_failures.on_success();
-                Ok(conn)
-            }
-            Err(err) => {
-                super::record_dial_failure(&self.name, &self.dial_failures, &proxy, &err);
-                Err(err)
-            }
-        }
+        let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
+        attempt.finish(proxy.dial_udp(metadata).await)
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {

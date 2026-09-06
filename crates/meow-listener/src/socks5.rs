@@ -41,6 +41,7 @@ pub async fn handle_socks5(
         Ok(PostHandshake::UdpAssociate {
             requested_ip,
             requested_port,
+            in_user,
         }) => {
             // The handshake (auth + request) is consumed; the control conn is
             // now ours for the association's lifetime.
@@ -50,8 +51,12 @@ pub async fn handle_socks5(
                 src_addr,
                 requested_ip,
                 requested_port,
-                in_name,
-                in_port,
+                &Metadata {
+                    in_name: in_name.into(),
+                    in_port,
+                    in_user: in_user.as_deref().map(Into::into),
+                    ..Default::default()
+                },
             )
             .await
             {
@@ -70,6 +75,7 @@ enum PostHandshake {
     UdpAssociate {
         requested_ip: Option<IpAddr>,
         requested_port: u16,
+        in_user: Option<String>,
     },
 }
 
@@ -167,6 +173,7 @@ async fn handle_socks5_inner(
         return Ok(PostHandshake::UdpAssociate {
             requested_ip: dst_ip,
             requested_port: dst_port,
+            in_user,
         });
     }
 

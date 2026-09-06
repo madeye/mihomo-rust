@@ -65,6 +65,17 @@ impl Hy2Options {
             return Err(format!("hysteria2[{}]: port must be non-zero", self.name));
         }
 
+        // Both set: the pin wins (see `hysteria2::tls::server_cert_verifier`).
+        // Say so once at load rather than let a user believe verification is
+        // off when it is not.
+        if self.skip_cert_verify && self.fingerprint.is_some() {
+            tracing::warn!(
+                "hysteria2[{}]: skip-cert-verify is ignored because fingerprint is set; \
+                 the certificate is still pinned",
+                self.name
+            );
+        }
+
         let obfs_password = match self.obfs {
             Some(Hy2Obfs::Salamander) => self.obfs_password.unwrap_or_default(),
             None => String::new(),

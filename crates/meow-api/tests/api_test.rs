@@ -2998,3 +2998,302 @@ async fn get_connections_entry_has_camel_case_shape() {
         "snake_case key must not appear"
     );
 }
+
+// Exercise actual sockets: an empty statistics map alone cannot prove closure.
+async fn live_connection(
+    state: &Arc<AppState>,
+) -> (
+    tokio::net::TcpStream,
+    tokio::net::TcpStream,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst = upstream.local_addr().unwrap();
+    let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(inbound.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = inbound.accept().await.unwrap();
+    let inner = Arc::clone(state.tunnel.inner());
+    let task = tokio::spawn(async move {
+        meow_tunnel::tcp::handle_tcp(
+            &inner,
+            Box::new(server),
+            meow_common::Metadata {
+                dst_ip: Some(dst.ip()),
+                dst_port: dst.port(),
+                ..Default::default()
+            },
+        )
+        .await;
+    });
+    let (mut remote, _) = upstream.accept().await.unwrap();
+    client.write_all(b"before close").await.unwrap();
+    let mut buf = [0; 12];
+    remote.read_exact(&mut buf).await.unwrap();
+    remote.write_all(&buf).await.unwrap();
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"before close");
+    (client, remote, task)
+}
+
+async fn assert_socket_closed(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut [0; 1]))
+        .await
+        .expect("connection still open after close request");
+    match result {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("expected EOF or RST, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_connection_terminates_only_selected_stream() {
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let (mut client, mut remote, task) = live_connection(&state).await;
+    let id = state.tunnel.statistics().active_connections()[0].id;
+    let (mut survivor, mut survivor_remote, survivor_task) = live_connection(&state).await;
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/connections/{id}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_socket_closed(&mut client).await;
+    assert_socket_closed(&mut remote).await;
+    task.await.unwrap();
+    assert_eq!(state.tunnel.statistics().active_connection_count(), 1);
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    survivor.write_all(b"ok").await.unwrap();
+    let mut buf = [0; 2];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        survivor_remote.read_exact(&mut buf),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&buf, b"ok");
+    state.tunnel.statistics().close_all_connections();
+    survivor_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_all_connections_terminates_both_stream_directions() {
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let mut streams = Vec::new();
+    for _ in 0..2 {
+        streams.push(live_connection(&state).await);
+    }
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/connections")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for (mut client, mut remote, task) in streams {
+        assert_socket_closed(&mut client).await;
+        assert_socket_closed(&mut remote).await;
+        task.await.unwrap();
+    }
+    assert_eq!(state.tunnel.statistics().active_connection_count(), 0);
+}
+
+#[tokio::test]
+async fn cold_reload_terminates_live_stream_without_drain_delay() {
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let (mut client, mut remote, task) = live_connection(&state).await;
+    use base64::Engine as _;
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,REJECT\n");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("cold reload must not wait for live connections to finish")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_socket_closed(&mut client).await;
+    assert_socket_closed(&mut remote).await;
+    task.await.unwrap();
+    let metadata = meow_common::Metadata {
+        dst_ip: Some("127.0.0.1".parse().unwrap()),
+        dst_port: 12345,
+        ..Default::default()
+    };
+    let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+    assert_eq!(
+        proxy.name(),
+        "REJECT",
+        "new connections must see the reloaded policy"
+    );
+}
+
+/// Force the real routing/DNS await to straddle two completed PUT requests.
+/// Before #510, this flow registers only after close_all and dials DIRECT
+/// using the old IP-CIDR rule, even though the active policy is now REJECT.
+#[tokio::test]
+async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
+    use base64::Engine as _;
+    use hickory_proto::{
+        op::Message,
+        rr::{rdata::A, RData, Record, RecordType},
+    };
+    use meow_common::{Metadata, Network};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::time::{timeout, Duration};
+
+    timeout(Duration::from_secs(5), async {
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut state = test_state(RawConfig {
+            rules: Some(vec![
+                "IP-CIDR,127.0.0.0/8,DIRECT".into(),
+                "MATCH,REJECT".into(),
+            ]),
+            ..Default::default()
+        });
+        let raw = state.raw_config.read().clone();
+        let tunnel = Tunnel::new(Arc::new(Resolver::new(
+            vec![dns.local_addr().unwrap()],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            false,
+        )));
+        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_proxies(proxies);
+        tunnel.update_rules(rules);
+        Arc::get_mut(&mut state).unwrap().tunnel = tunnel;
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = origin.local_addr().unwrap();
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(inbound.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = inbound.accept().await.unwrap();
+        let inner = Arc::clone(state.tunnel.inner());
+        let task = tokio::spawn(async move {
+            meow_tunnel::tcp::handle_tcp(
+                &inner,
+                Box::new(server),
+                Metadata {
+                    host: "reload.test".into(),
+                    dst_port: destination.port(),
+                    network: Network::Tcp,
+                    ..Default::default()
+                },
+            )
+            .await;
+        });
+
+        let mut packet = [0; 512];
+        let (len, peer) = dns.recv_from(&mut packet).await.unwrap();
+        let query = Message::from_vec(&packet[..len]).unwrap();
+        assert_eq!(query.queries[0].query_type, RecordType::A);
+        assert_eq!(state.tunnel.statistics().active_connection_count(), 0);
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode("mode: rule\nrules:\n  - MATCH,REJECT\n");
+        for _ in 0..2 {
+            let response = create_router(Arc::clone(&state))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/configs")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"payload": payload}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+        response.metadata.recursion_desired = true;
+        response.metadata.recursion_available = true;
+        response
+            .add_queries(query.queries.iter().cloned())
+            .add_answer(Record::from_rdata(
+                query.queries[0].name.clone(),
+                60,
+                RData::A(A(Ipv4Addr::LOCALHOST)),
+            ));
+        dns.send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+
+        tokio::select! {
+            biased;
+            _ = origin.accept() => panic!("old-policy TCP setup escaped reload and dialed DIRECT"),
+            result = task => result.unwrap(),
+        }
+        assert_socket_closed(&mut client).await;
+        assert_eq!(state.tunnel.statistics().active_connection_count(), 0);
+        // A new real connection observes REJECT, rather than being blocked
+        // by a forgotten admission flag or using the previous DIRECT rule.
+        let mut fresh_client = TcpStream::connect(inbound.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (fresh_server, _) = inbound.accept().await.unwrap();
+        let metadata = Metadata {
+            dst_ip: Some(destination.ip()),
+            dst_port: destination.port(),
+            network: Network::Tcp,
+            ..Default::default()
+        };
+        let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+        assert_eq!(proxy.name(), "REJECT");
+        let inner = Arc::clone(state.tunnel.inner());
+        let fresh_task = tokio::spawn(async move {
+            meow_tunnel::tcp::handle_tcp(&inner, Box::new(fresh_server), metadata).await;
+        });
+        tokio::select! {
+            biased;
+            _ = origin.accept() => panic!("new TCP setup used the old DIRECT policy"),
+            () = assert_socket_closed(&mut fresh_client) => {},
+        }
+        // REJECT supplies a read EOF; close the upload half too before
+        // waiting for the bidirectional relay task to finish.
+        drop(fresh_client);
+        fresh_task.await.unwrap();
+    })
+    .await
+    .expect("DNS-delayed setup escaped cold reload or admission did not recover");
+}

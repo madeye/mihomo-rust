@@ -3,6 +3,29 @@
 Status: **draft** — owner: pm. Last updated: 2026-04-18.
 Tracks: task #23. Companion to `docs/specs/api-config-reload.md`.
 
+Scope amendment (2026-09-05, [#510](https://github.com/meow-rs/meow-rs/issues/510)):
+the current acceptance scope is immediate TCP cancellation plus a synchronized
+routing/registration boundary, not listener teardown or five-second draining.
+**C3/C4 are superseded, not fulfilled.** C1/C2 and F1 remain deferred to listener
+reconciliation/M3; the ArcSwap-specific cases were superseded by #327. The
+historical case list below does not override these amendments.
+
+Current regressions run in the existing `meow-tunnel --lib`, `api_test`, and
+`http_connection_close` suites, which are already included in CI:
+
+| Case | Evidence |
+|------|----------|
+| DNS-delayed setup crosses two completed PUT requests | Release a real loopback DNS answer afterward; the old DIRECT destination must never be dialed, inbound must receive EOF/RST, and a fresh connection must obey REJECT. |
+| Plain HTTP setup crosses publication | Pause rule matching before registration, reload, and resume; the old DIRECT origin must never be contacted and the client receives EOF. |
+| Registration races closure | A setup either registers before cancellation and observes its close signal, or is rejected without an entry. Repeated reloads of the same config cannot admit an old setup. |
+| Candidate preparation and snapshot publication | Pause rule compilation; readers still see the entire old snapshot and old flows remain registered. After publication, new rules and proxies agree; non-cold updates preserve flows. |
+| Immediate cancellation | Existing #509 live-stream regression observes EOF/RST in both directions without a five-second wait. |
+
+Admission begins at TCP routing, after handshake/sniffing. A pending DNS query
+need not be cancelled immediately, but cannot register or dial with its old
+decision after returning. UDP flow cancellation and listener/DNS configuration
+reconciliation are outside this PR's acceptance scope.
+
 This is the QA-owned acceptance test plan. The spec's `§Test plan` section
 is the PM's starting point; this document is the final shape engineer should
 implement against. If the spec and this document disagree, **this document
@@ -94,7 +117,7 @@ calls. No real listeners spawned. Use `#[tokio::test]`.
 | B5 | `get_configs_mode_field_reflects_current_mode` | Config with `mode: rule`. Assert `"mode": "rule"` in response. Regression guard that mode is serialised from active config, not a hardcoded default. |
 | B6 | `get_configs_after_reload_reflects_new_config` **[guard-rail]** | Start with `mixed-port: 7890`. Reload to `mixed-port: 7891`. `GET /configs`. Assert `"mixed-port": 7891`. Guards that GET reflects post-reload state, not stale pre-reload config. |
 
-### C. `AppState::reload()` unit tests
+### C. Original `AppState::reload()` unit tests (see amendment above)
 
 These test the reload lifecycle in isolation with mock listeners and a
 controlled connection count.

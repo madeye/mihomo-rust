@@ -9,6 +9,28 @@ See also: roadmap M3 "hot config reload without dropping connections" — this
 M1 spec is the cold-reload endpoint; M3 upgrades it to hot-reload.
 Upstream reference: `hub/server.go::patchConfig`, `component/profile/profile.go`.
 
+Scope amendment (2026-09-05, [#510](https://github.com/meow-rs/meow-rs/issues/510)):
+retain immediate cold-reload cancellation from #509 and fix the TCP admission
+boundary and routing snapshot publication. The original five-second drain
+design and test-plan C3/C4 are **superseded**, not completed. Listener lifecycle
+reconciliation and connection-preserving hot reload remain separate M3 work.
+
+The current boundary is the start of TCP routing, after inbound handshake and
+sniffing. Setup captures a generation before reading mode/rules/proxies. It
+registers under a read lock only if that generation is still current. Reload
+builds and compiles the candidate first, then holds the matching write lock to
+advance the generation, cancel tracked TCP flows, and publish rules/proxies
+as one `Arc<RouteTable>` plus the requested mode. No lock spans DNS awaits or
+relay. A DNS-delayed setup is rejected when it returns; cancellation of DNS
+itself and inbound handshakes is not promised. A handshake that reaches routing
+after the boundary uses the new configuration.
+
+`connections_dropped` counts closure requests for registered TCP flows, not
+completed socket teardowns or rejected unregistered setups. UDP sessions are
+outside this boundary. Ordinary listener bindings/authentication and DNS
+runtime are not rebuilt by PUT; TUN reconciliation currently compares only
+`tun.enable`. These configuration-application gaps remain separate work.
+
 ## Motivation
 
 The REST API has no way to reload configuration at runtime — operators must
@@ -17,9 +39,9 @@ standard part of the Clash/mihomo API surface that dashboard tools (Yacd,
 MetaCubeXD) call after a user edits configuration. Without it, dashboard
 config editors are broken.
 
-M1 scope is a **cold reload**: the running tunnel and all listeners are torn
-down and re-initialized from the new config. Connections in flight are dropped.
-This is an intentional simplification — hot-reload (no connection drop) is M3.
+The implemented **cold reload** cancels tracked TCP flows and replaces routing
+configuration. Connection-preserving hot reload is M3. Full listener teardown
+from the original M1 design was never implemented.
 
 ## Scope
 
@@ -31,8 +53,8 @@ In scope:
    restart even if the config has parse errors. If unset and config is invalid,
    return 400 and leave current config unchanged.
 3. Config validation (parse + schema check) before teardown of current config.
-4. Graceful teardown: close all listeners, wait for in-flight connections to
-   drain (up to a configurable timeout), then start fresh with new config.
+4. Immediately cancel registered TCP flows and reject older routing setups
+   across one synchronized configuration-publication boundary.
 5. Response: `204 No Content` on success; `400 Bad Request` with error
    message body on parse failure (when `?force=false`).
 6. Auth: `require_auth` middleware — same as all other mutating REST endpoints.
@@ -181,7 +203,7 @@ pub async fn put_configs(
 }
 ```
 
-### AppState::reload
+### Original AppState::reload design (superseded by the scope amendment)
 
 ```rust
 impl AppState {
@@ -196,7 +218,7 @@ impl AppState {
 }
 ```
 
-**Drain timeout**: 5 seconds, not configurable in M1. After 5s, force-close
+**Historical drain timeout**: 5 seconds, not configurable in M1. After 5s, force-close
 remaining connections with a structured log:
 
 ```rust
@@ -256,8 +278,8 @@ line breaks. This matches what dashboard tools encode (MetaCubeXD, Yacd).
 
 ## Acceptance criteria
 
-1. `PUT /configs` with valid `path` → 204; new config active; old listeners
-   stopped and new listeners started on new ports.
+1. `PUT /configs` with valid `path` → 204; new routing config active.
+   Rebinding listeners to changed ports remains a separate M3 requirement.
 2. `PUT /configs` with valid `payload` (base64 YAML) → 204; same effect.
 3. `PUT /configs` with invalid YAML → 400 with error message body;
    current config unchanged.
@@ -302,7 +324,7 @@ line breaks. This matches what dashboard tools encode (MetaCubeXD, Yacd).
   config with `mixed-port: 7891`; assert old port closed, new port listening.
   NOT old port still accepting. NOT new port unopened.
 
-## Implementation checklist (engineer handoff)
+## Original implementation checklist (historical; see scope amendment)
 
 - [ ] Add `arc-swap = "1"` and `base64 = "0.22"` to `crates/meow-api/Cargo.toml`.
 - [ ] Wrap `tunnel` in `Arc<ArcSwap<Tunnel>>` in `AppState`; update all handlers

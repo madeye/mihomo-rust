@@ -12,8 +12,8 @@
 //! special two ways: with `dns-hijack` enabled each query is answered
 //! in-process by `DnsServer::handle_query` — statelessly, no flow entry
 //! (required for fake-IP mode — point the OS resolver at any address
-//! inside the routed range); without it the flow bypasses rule matching to
-//! DIRECT, mirroring the tunnel-level DNS bypass.
+//! inside the routed range); without it the flow follows ordinary routing
+//! rules, including REJECT and proxy selection.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -23,7 +23,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use ipnet::Ipv4Net;
 use lwip::UdpSocket;
-use meow_common::{ConnType, Metadata, Network, ProxyAdapter};
+use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer};
 use meow_tunnel::Tunnel;
 use tokio::sync::mpsc;
@@ -195,34 +195,23 @@ async fn relay_flow(
     };
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
-    // Port-53 DIRECT bypass (dns-hijack off), mirroring
-    // `meow_tunnel::udp::handle_udp`: never loop client DNS through a proxy.
-    let proxy: Arc<dyn ProxyAdapter> = if metadata.dst_port == 53 {
-        Arc::clone(&inner.direct) as Arc<dyn ProxyAdapter>
-    } else {
-        match inner.resolve_proxy(&metadata) {
-            Some((p, rule_name, rule_payload)) => {
-                info!(
-                    "UDP {} --> {} match {}({}) using {}",
-                    src,
-                    metadata.remote_address(),
-                    rule_name,
-                    rule_payload,
-                    p.name()
-                );
-                p
-            }
-            None => {
-                return Err(format!(
-                    "no matching rule for {}",
-                    metadata.remote_address()
-                ))
-            }
-        }
+    // Non-hijacked client traffic follows the same policy on every port.
+    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy(&metadata) else {
+        return Err(format!(
+            "no matching rule for {}",
+            metadata.remote_address()
+        ));
     };
+    info!(
+        "UDP {} --> {} match {}({}) using {}",
+        src,
+        metadata.remote_address(),
+        rule_name,
+        rule_payload,
+        proxy.name()
+    );
 
-    let conn = proxy
-        .dial_udp(&metadata)
+    let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
         .await
         .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?;
 
@@ -287,6 +276,26 @@ mod tests {
     use super::is_looping_dst;
     use ipnet::Ipv4Net;
     use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn udp_port_53_obeys_reject_rule_without_hijack() {
+        let tunnel = crate::test_rule_tunnel();
+        for port in [53, 5353] {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel(1);
+            let result = super::relay_flow(
+                &tunnel,
+                rx,
+                reply_tx,
+                "127.0.0.1:12345".parse().unwrap(),
+                ([127, 0, 0, 1], port).into(),
+                std::time::Duration::from_millis(100),
+                "tun",
+            )
+            .await;
+            assert!(result.unwrap_err().contains("rejected"));
+        }
+    }
 
     fn net() -> Ipv4Net {
         "172.19.0.1/30".parse().unwrap()
