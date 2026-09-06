@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::{CancellationToken, PollSender};
 
 const CMD_SYN: u8 = 0;
@@ -33,16 +33,12 @@ const FRAME_HEADER_LEN: usize = 8;
 const MAX_FRAME_SIZE: usize = 32768;
 /// Per-stream channel depth.  The 4 MiB `receive_budget` semaphore bounds
 /// memory; the channel depth only controls how many frames buffer before a
-/// stalled consumer pauses the reader.  A depth of 2 (two max-sized frames)
-/// head-of-line blocks the entire session too easily — one slow tab stalls
-/// every other stream sharing the physical connection.  32 gives real
-/// headroom; the semaphore still caps total buffered memory.
-///
-/// The target architecture is muxcool's `deliver_now` / `Parked` pattern
-/// (PR 6 of this stack): a full queue parks the delivery and pauses the
-/// connection read (session-wide flow control) without blocking writers.
-/// Porting that to smux is a follow-up; this depth raise is the safe
-/// interim fix.
+/// stalled consumer parks delivery and pauses the connection read —
+/// session-wide flow control with TCP window semantics, matching muxcool's
+/// `deliver_now` / `Parked` pattern (issue #425): the reader never blocks
+/// on a stream queue, so a consumer stalled mid-write cannot deadlock
+/// writers sharing the session.  Consumers wake the reader (the `space`
+/// Notify) whenever they drain a queue or drop a stream.
 const STREAM_QUEUE: usize = 32;
 /// Sagernet's default session-wide receive budget.
 const MAX_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
@@ -105,6 +101,54 @@ struct InboundChunk {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+/// One inbound chunk parked because its stream's queue is full.  At most
+/// one exists at a time: parking pauses the connection read (session-wide
+/// flow control, TCP window semantics), so no further frames pile up.  The
+/// reader retries without blocking — it never blocks on a stream queue, so
+/// a consumer stalled mid-write cannot deadlock writers sharing the
+/// session.
+struct Parked {
+    tx: mpsc::Sender<InboundChunk>,
+    chunk: InboundChunk,
+}
+
+/// Try to hand one chunk to a stream without blocking: on a full queue the
+/// chunk parks, on a closed channel (stream gone) it is moot.
+fn deliver_now(tx: Option<mpsc::Sender<InboundChunk>>, chunk: InboundChunk) -> Option<Parked> {
+    let tx = tx?;
+    match tx.try_send(chunk) {
+        Err(mpsc::error::TrySendError::Full(chunk)) => Some(Parked { tx, chunk }),
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => None,
+    }
+}
+
+/// Retry a parked delivery: succeeds the moment the consumer drained its
+/// queue, or the channel closed because the consumer dropped the stream.
+fn retry_parked(parked: &mut Option<Parked>) {
+    if let Some(mut p) = parked.take() {
+        match p.tx.try_send(p.chunk) {
+            Err(mpsc::error::TrySendError::Full(chunk)) => {
+                p.chunk = chunk;
+                *parked = Some(p);
+            }
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+/// Fires the session's space Notify when dropped: wakes a reader parked on
+/// the full inbound queue once the stream (and its receiver) is gone, so
+/// the parked delivery fails fast and reading resumes.  Kept as a field
+/// declared after the receiver so the channel closes before the notify
+/// fires.
+struct SpaceWake(Arc<Notify>);
+
+impl Drop for SpaceWake {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 /// One outbound writer request.  Flush requests travel the SAME bounded
 /// channel as data frames so a flush can never overtake frames the
 /// requesting stream queued earlier (FIFO guarantee).  `Clone` keeps
@@ -121,6 +165,11 @@ struct SessionState {
     /// Streams keyed by stream ID; dropping the sender EOFs the stream.
     streams: Mutex<HashMap<u32, mpsc::Sender<InboundChunk>>>,
     dead: AtomicBool,
+    /// Fired by stream consumers whenever they drain their inbound queue
+    /// (or drop the stream): wakes a reader parked on a full queue.
+    /// notify_one keeps a permit for the arm-before-check pattern in the
+    /// reader loop, so no wake is lost.
+    space: Arc<Notify>,
 }
 
 /// smux session over one physical connection (client role).
@@ -149,6 +198,7 @@ impl Session {
         let state = Arc::new(SessionState {
             streams: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
+            space: Arc::new(Notify::new()),
         });
         let receive_budget = Arc::new(Semaphore::new(MAX_RECEIVE_BUFFER));
         let cancel = CancellationToken::new();
@@ -202,30 +252,49 @@ impl Session {
             writer_cancel.cancel();
         });
 
-        // Reader task: parse frames, route PSH/FIN to streams.
+        // Reader task: parse frames, route PSH/FIN to streams.  Inbound
+        // delivery never blocks the reader: a frame that hits a full
+        // stream queue parks (at most one) and pauses the connection read
+        // — session-wide flow control with TCP window semantics — while
+        // the writer task keeps servicing outbound frames.
         let reader_state = Arc::clone(&state);
         let reader_cancel = cancel.clone();
+        let reader_space = Arc::clone(&state.space);
         tokio::spawn(async move {
             let mut header = [0u8; FRAME_HEADER_LEN];
-            loop {
+            let mut parked: Option<Parked> = None;
+            'reader: loop {
+                while parked.is_some() {
+                    // Armed before the retry so a drain in the gap between
+                    // them is not lost: notify_one stores a permit when no
+                    // waiter is registered yet, and this future consumes it.
+                    let space_fut = reader_space.notified();
+                    retry_parked(&mut parked);
+                    if parked.is_some() {
+                        tokio::select! {
+                            _ = reader_cancel.cancelled() => break 'reader,
+                            _ = space_fut => {}
+                        }
+                    }
+                }
                 let header_result = tokio::select! {
-                    _ = reader_cancel.cancelled() => break,
+                    _ = reader_cancel.cancelled() => break 'reader,
                     result = reader.read_exact(&mut header) => result,
                 };
                 if header_result.is_err() {
-                    break;
+                    break 'reader;
                 }
                 let Ok((cmd, length, stream_id)) = Frame::decode_header(&header) else {
-                    break;
+                    break 'reader;
                 };
                 let permit = if cmd == CMD_PSH && length > 0 {
                     let permits = length as u32;
                     match tokio::select! {
-                        _ = reader_cancel.cancelled() => break,
+                        _ = reader_cancel.cancelled() => break 'reader,
                         result = Arc::clone(&receive_budget).acquire_many_owned(permits) => result,
                     } {
                         Ok(permit) => Some(permit),
-                        Err(_) => break,
+                        Err(_) => break 'reader,
                     }
                 } else {
                     None
@@ -233,14 +302,14 @@ impl Session {
                 let mut payload = vec![0u8; length];
                 if !payload.is_empty() {
                     let payload_result = tokio::select! {
-                        _ = reader_cancel.cancelled() => break,
+                        _ = reader_cancel.cancelled() => break 'reader,
                         result = reader.read_exact(&mut payload) => result,
                     };
                     if payload_result.is_err() {
-                        break;
+                        break 'reader;
                     }
                 }
-                if reader_state
+                match reader_state
                     .handle_frame(
                         cmd,
                         stream_id,
@@ -248,12 +317,12 @@ impl Session {
                             data: Bytes::from(payload),
                             _permit: permit,
                         },
-                        &reader_cancel,
                     )
                     .await
-                    .is_err()
                 {
-                    break;
+                    Ok(Some(p)) => parked = Some(p),
+                    Ok(None) => {}
+                    Err(_) => break 'reader,
                 }
             }
             reader_state.mark_dead().await;
@@ -311,6 +380,7 @@ impl Session {
             shutdown_frame: None,
             flush_rx: None,
             write_since_flush: false,
+            wake: SpaceWake(Arc::clone(&self.state.space)),
         })
     }
 }
@@ -365,8 +435,7 @@ impl SessionState {
         cmd: u8,
         stream_id: u32,
         chunk: InboundChunk,
-        cancel: &CancellationToken,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Parked>> {
         match cmd {
             CMD_PSH => {
                 // Data for an unknown stream is dropped rather than killing
@@ -375,27 +444,14 @@ impl SessionState {
                 // may legitimately race a FIN (peer closed, stream removed)
                 // against in-flight PSH frames.
                 let tx = self.streams.lock().await.get(&stream_id).cloned();
-                if let Some(tx) = tx {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "smux session closed",
-                            ));
-                        }
-                        result = tx.send(chunk) => {
-                            let _ = result;
-                        }
-                    }
-                }
-                Ok(())
+                Ok(deliver_now(tx, chunk))
             }
             CMD_FIN => {
                 // Peer half-closed: EOF the read side by dropping the sender.
                 self.streams.lock().await.remove(&stream_id);
-                Ok(())
+                Ok(None)
             }
-            CMD_NOP => Ok(()),
+            CMD_NOP => Ok(None),
             // v1 has no UPD; a server-initiated SYN is unexpected in
             // client-only usage and unsupported commands are protocol errors.
             CMD_SYN => Err(io::Error::new(
@@ -427,6 +483,10 @@ pub struct SmuxStream {
     /// sent: the flush ack then no longer covers every write, so
     /// `poll_flush` must send another request once the pending one lands.
     write_since_flush: bool,
+    /// Acts through Drop (wakes a reader parked on the full inbound queue
+    /// once the receiver is gone); never read.
+    #[allow(dead_code, reason = "SpaceWake acts through Drop, not reads")]
+    wake: SpaceWake,
 }
 
 impl SmuxStream {
@@ -509,6 +569,11 @@ impl AsyncRead for SmuxStream {
             loop {
                 match this.rx.poll_recv(cx) {
                     Poll::Ready(Some(mut chunk)) => {
+                        // The channel slot just freed: wake a reader parked
+                        // on this stream's full queue (notify_one keeps a
+                        // permit when no waiter is registered yet, so the
+                        // wake is never lost).
+                        this.session.state.space.notify_one();
                         if chunk.data.is_empty() {
                             // Zero-length PSH frames carry no payload (flush /
                             // ack signals from the peer); returning Ready with
@@ -524,6 +589,11 @@ impl AsyncRead for SmuxStream {
                         return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(None) => {
+                        // The channel closed (peer FIN or session death):
+                        // wake so a parked delivery observes the closed
+                        // channel instead of waiting for a drain that will
+                        // never come.
+                        this.session.state.space.notify_one();
                         this.eof = true;
                         if this.session.is_dead() {
                             return Poll::Ready(Err(io::Error::new(
@@ -764,6 +834,92 @@ mod tests {
         assert_eq!(&buf, b"AAA");
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"BBB");
+    }
+
+    /// Regression (issue #425): a full stream queue parks the delivery and
+    /// pauses the connection read instead of blocking the reader on a
+    /// stream channel.  Draining the queue (the space Notify) delivers the
+    /// parked chunk and resumes the session.
+    #[tokio::test]
+    async fn full_stream_queue_parks_and_draining_resumes() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let mut a = session.open_stream().await.unwrap();
+        let mut b = session.open_stream().await.unwrap();
+
+        // Fill A's queue exactly, then one more A chunk (the parked one),
+        // then one chunk for B which must stay unread while paused.
+        let mut wire = Vec::new();
+        for _ in 0..STREAM_QUEUE {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, a.id, b"x"));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_PSH, a.id, b"p"));
+        wire.extend_from_slice(&encode_frame(CMD_PSH, b.id, b"y"));
+        server_io.write_all(&wire).await.unwrap();
+
+        // The session is paused: B sees nothing while A's consumer idles.
+        let mut one = [0u8; 1];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), b.read(&mut one))
+                .await
+                .is_err(),
+            "the connection read must pause while a stream queue is full"
+        );
+        // The pause is read-side only: writers sharing the session keep
+        // flowing (a consumer stalled mid-write cannot deadlock them).
+        tokio::time::timeout(std::time::Duration::from_secs(1), a.write_all(b"ping"))
+            .await
+            .expect("stream writes must not stall while a queue is parked")
+            .unwrap();
+
+        // Draining A delivers the parked chunk and resumes reading, so
+        // B's chunk flows.
+        let mut drain = vec![0u8; STREAM_QUEUE + 1];
+        tokio::time::timeout(std::time::Duration::from_secs(1), a.read_exact(&mut drain))
+            .await
+            .expect("draining must not hang")
+            .unwrap();
+        assert_eq!(&drain[..STREAM_QUEUE], &[b'x'; STREAM_QUEUE]);
+        assert_eq!(drain[STREAM_QUEUE], b'p');
+        tokio::time::timeout(std::time::Duration::from_secs(1), b.read(&mut one))
+            .await
+            .expect("reading must resume after the consumer drains")
+            .unwrap();
+        assert_eq!(&one, b"y");
+    }
+
+    /// Regression (issue #425): dropping a stream whose full queue parked
+    /// the reader must unblock the session — the SpaceWake fires, the
+    /// parked delivery observes the closed channel, and reading resumes.
+    #[tokio::test]
+    async fn dropping_stalled_stream_resumes_session() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::client(client_io).unwrap());
+        let a = session.open_stream().await.unwrap();
+        let mut b = session.open_stream().await.unwrap();
+
+        let mut wire = Vec::new();
+        for _ in 0..STREAM_QUEUE {
+            wire.extend_from_slice(&encode_frame(CMD_PSH, a.id, b"x"));
+        }
+        wire.extend_from_slice(&encode_frame(CMD_PSH, a.id, b"p"));
+        wire.extend_from_slice(&encode_frame(CMD_PSH, b.id, b"y"));
+        server_io.write_all(&wire).await.unwrap();
+
+        let mut one = [0u8; 1];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), b.read(&mut one))
+                .await
+                .is_err(),
+            "the connection read must pause while a stream queue is full"
+        );
+
+        drop(a);
+        tokio::time::timeout(std::time::Duration::from_secs(1), b.read(&mut one))
+            .await
+            .expect("reading must resume after the stalled stream drops")
+            .unwrap();
+        assert_eq!(&one, b"y");
     }
 
     #[tokio::test]
