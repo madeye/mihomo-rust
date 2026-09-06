@@ -180,8 +180,10 @@ fn ensure_hysteria_binary(dir: &Path) -> Option<PathBuf> {
 }
 
 fn start_hysteria_server(port: u16) -> Option<HysteriaServer> {
-    if !cfg!(target_os = "linux") {
-        skip_or_panic("test requires Linux");
+    // The Docker image only yields a Linux binary; any platform can run with a
+    // native binary supplied through MEOW_HYSTERIA_BIN.
+    if !cfg!(target_os = "linux") && std::env::var_os("MEOW_HYSTERIA_BIN").is_none() {
+        skip_or_panic("test requires Linux or MEOW_HYSTERIA_BIN");
         return None;
     }
     if std::env::var_os("MEOW_HYSTERIA_BIN").is_none() && !docker_available() {
@@ -388,12 +390,21 @@ async fn hysteria2_docker_tcp_and_udp_round_trip() {
         .await
         .expect("udp associate timed out")
         .unwrap_or_else(|e| panic!("udp associate failed: {e}\n{}", server.logs()));
-    // Exercise multiple packets: an accidental HTTP/3 datagram receiver can
-    // race the raw QUIC receiver and let a single packet pass by chance.
-    // Include payloads requiring fragmentation in both directions.
-    // v2.9.2 has a 4096-byte serialization buffer including the UDP header,
-    // so keep the payload below that while still requiring several fragments.
-    for (i, size) in [17, 64, 512, 4000].into_iter().cycle().take(12).enumerate() {
+    // Exercise many packets across sizes. This is the regression guard for the
+    // HTTP/3-datagram bug: when the client advertised SETTINGS_H3_DATAGRAM,
+    // quic-go started an HTTP/3 datagram receiver that stole the raw QUIC relay
+    // datagrams, so nearly every UDP packet was lost. A single lucky packet
+    // could still slip through by racing that receiver, hence the repetition.
+    //
+    // Every payload here fits in one QUIC DATAGRAM, which is what hysteria2's
+    // UDP relay delivers reliably. A UDP message large enough to be fragmented
+    // over several DATAGRAMs is best-effort: QUIC datagrams are not
+    // retransmitted, and against a real v2.6+ server the oversized return
+    // fragments are dropped while the path MTU is still being probed. The
+    // client's fragmentation and reassembly are covered deterministically by
+    // the driver unit test `raw_udp_round_trip_without_http3_datagrams`, which
+    // round-trips a 4096-byte payload through an in-process echo peer.
+    for (i, size) in [17, 64, 512, 1100].into_iter().cycle().take(16).enumerate() {
         let udp_payload = vec![i as u8; size];
         timeout(T, packet_conn.write_packet(&udp_payload, &udp_echo))
             .await
