@@ -167,7 +167,7 @@ pub struct H2Stream {
     pending_write: Option<Bytes>,
     remote_no_error_is_eof: bool,
     eos_sent: bool,
-    conn_abort: Option<tokio::task::AbortHandle>,
+    conn_driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl H2Stream {
@@ -179,12 +179,12 @@ impl H2Stream {
             pending_write: None,
             remote_no_error_is_eof: false,
             eos_sent: false,
-            conn_abort: None,
+            conn_driver: None,
         }
     }
 
-    pub fn with_conn_abort(mut self, handle: tokio::task::AbortHandle) -> Self {
-        self.conn_abort = Some(handle);
+    pub fn with_conn_driver(mut self, driver: tokio::task::JoinHandle<()>) -> Self {
+        self.conn_driver = Some(driver);
         self
     }
 
@@ -215,21 +215,33 @@ impl H2Stream {
 impl Drop for H2Stream {
     fn drop(&mut self) {
         self.best_effort_eos();
-        let Some(abort_handle) = self.conn_abort.take() else {
+        let Some(mut driver) = self.conn_driver.take() else {
             return;
         };
         let recv = self.recv.take();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            abort_handle.abort();
+            driver.abort();
             return;
         };
         runtime.spawn(async move {
-            if let Some(recv) = recv {
-                let _ = tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, recv.drain()).await;
-            } else {
-                tokio::task::yield_now().await;
+            // Response EOF only closes the peer's sending half. Keep driving
+            // queued request DATA/EOS until the connection itself completes;
+            // draining the response releases its flow-control window and refs.
+            let finish = async {
+                let drain = async {
+                    if let Some(recv) = recv {
+                        recv.drain().await;
+                    }
+                };
+                let _ = tokio::join!(drain, &mut driver);
+            };
+            if tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, finish)
+                .await
+                .is_err()
+            {
+                driver.abort();
+                let _ = driver.await;
             }
-            abort_handle.abort();
         });
     }
 }
@@ -798,7 +810,7 @@ mod tests {
     /// h2mux, which share this type (issue #423, follow-up to #417).
     #[tokio::test]
     async fn drop_sends_end_of_stream_not_reset() {
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_io, server_io) = tokio::io::duplex(64);
 
         let server = tokio::spawn(async move {
             let mut connection = h2::server::Builder::new()
@@ -837,7 +849,7 @@ mod tests {
             tokio::select! {
                 body_result = read_body => {
                     let received = body_result.expect("drop must end the stream cleanly, not reset it");
-                    assert_eq!(received, b"hello", "bytes written before drop must survive");
+                    assert_eq!(received, vec![42u8; 4096], "bytes written before drop must survive");
                 }
                 () = drive => unreachable!("drive never resolves"),
             }
@@ -860,19 +872,26 @@ mod tests {
             .send_request(request, false)
             .expect("send_request");
         let mut stream =
-            H2Stream::new(send_stream, RecvState::new(response)).with_conn_abort(abort_handle);
+            H2Stream::new(send_stream, RecvState::new(response)).with_conn_driver(driver_task);
 
-        stream.write_all(b"hello").await.expect("write");
+        drop(send_request);
+        let mut response_body = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response_body)
+            .await
+            .expect("read response EOF before upload");
+        stream.write_all(&vec![42u8; 4096]).await.expect("write");
         drop(stream);
 
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("server must observe end-of-stream")
             .expect("server task");
-        let driver_error = tokio::time::timeout(Duration::from_secs(5), driver_task)
-            .await
-            .expect("driver must be aborted after response drain")
-            .expect_err("driver task must end by abort");
-        assert!(driver_error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver must terminate after drop");
     }
 }

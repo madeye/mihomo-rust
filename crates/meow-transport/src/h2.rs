@@ -132,7 +132,7 @@ impl Transport for H2Layer {
         // the first read instead — see `h2_common::RecvState`.
         Ok(Box::new(
             H2Stream::new(send_stream, RecvState::new(response_future))
-                .with_conn_abort(abort_handle),
+                .with_conn_driver(driver_task),
         ))
     }
 }

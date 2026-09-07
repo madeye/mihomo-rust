@@ -55,7 +55,7 @@ async fn xhttp_round_trip_1mib() {
     let req_info = rx.recv().await.expect("server received request info");
     assert_eq!(req_info.method, "POST");
     assert_eq!(req_info.scheme.as_deref(), Some("https"));
-    assert_eq!(req_info.path_and_query, "/xhttp-test?ed=1");
+    assert_eq!(req_info.path_and_query, "/xhttp-test/?ed=1");
     assert_eq!(req_info.authority.as_deref(), Some("example.com"));
     assert_eq!(
         req_info
@@ -70,7 +70,7 @@ async fn xhttp_round_trip_1mib() {
         .and_then(|v| v.to_str().ok())
         .expect("default padding Referer");
     let padding = referer
-        .strip_prefix("https://example.com/xhttp-test?x_padding=")
+        .strip_prefix("https://example.com/xhttp-test/?x_padding=")
         .expect("Referer must replace the original query with x_padding");
     assert_eq!(padding.len(), 128);
     assert!(padding.bytes().all(|b| b == b'X'));
@@ -170,7 +170,7 @@ async fn xhttp_headers_and_no_grpc_header() {
     let req_info = rx.recv().await.expect("server received request info");
     assert_eq!(req_info.method, "POST");
     assert_eq!(req_info.scheme.as_deref(), Some("https"));
-    assert_eq!(req_info.path_and_query, "/custom");
+    assert_eq!(req_info.path_and_query, "/custom/");
     assert_eq!(req_info.authority.as_deref(), Some("custom.host"));
     assert_eq!(
         req_info
@@ -281,4 +281,31 @@ async fn xhttp_config_validation() {
         "min (500) cannot exceed max (100)",
     )
     .await;
+}
+
+/// A peer that never sends response headers must not retain the driver forever.
+#[tokio::test]
+async fn xhttp_drop_bounds_stalled_driver_lifetime() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local address");
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.expect("accept");
+        let mut bytes = Vec::new();
+        tcp.read_to_end(&mut bytes)
+            .await
+            .expect("client closes TCP");
+        assert!(bytes.starts_with(b"PRI * HTTP/2.0"));
+    });
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let stream = XhttpLayer::new(XhttpConfig::default())
+        .connect(Box::new(tcp))
+        .await
+        .expect("lazy XHTTP connect");
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("stalled driver must terminate after drop")
+        .expect("server task");
 }

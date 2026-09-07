@@ -159,11 +159,12 @@ jobs:
       # Per-feature-combination *compile* coverage (the old G1-G6 matrix)
       # lives in the feature-powerset job; the nightly coverage workflow
       # runs these same tests under --all-features.
-      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade)
+      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP)
         run: |
-          cargo test -p meow-transport --features "grpc,h2,httpupgrade" \
+          cargo test -p meow-transport --features "grpc,h2,httpupgrade,xhttp" \
             --test grpc_test \
             --test h2_test \
+            --test xhttp_test \
             --test httpupgrade_test \
             -- --nocapture
 

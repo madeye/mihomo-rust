@@ -108,12 +108,13 @@ impl Transport for XhttpLayer {
             .cloned()
             .unwrap_or_else(|| "localhost".to_string());
         let authority = format_authority(&host);
+        let path_and_query = normalize_path(&self.config.path);
 
         let mut request_builder = http::Request::builder()
             .method(http::Method::POST)
             .uri(format!(
                 "{}://{}{}",
-                self.config.scheme, authority, self.config.path
+                self.config.scheme, authority, path_and_query
             ));
 
         let has_content_type = self
@@ -146,11 +147,9 @@ impl Transport for XhttpLayer {
                     };
                     if pad_len > 0 {
                         let padding = "X".repeat(pad_len);
-                        let path = self
-                            .config
-                            .path
+                        let path = path_and_query
                             .split_once('?')
-                            .map_or(self.config.path.as_str(), |(path, _)| path);
+                            .map_or(path_and_query.as_str(), |(path, _)| path);
                         let referer = format!(
                             "{}://{}{}?x_padding={padding}",
                             self.config.scheme, authority, path
@@ -209,12 +208,29 @@ impl Transport for XhttpLayer {
                     "xhttp",
                 ),
             )
-            .with_conn_abort(abort_handle),
+            .with_conn_driver(driver_task),
         ))
     }
 }
 
 // ─── Validation Helpers ───────────────────────────────────────────────────────
+
+// Xray normalizes the base path with a trailing slash before matching it,
+// including stream-one requests that carry no session ID in the path.
+fn normalize_path(path_and_query: &str) -> String {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
+    let mut normalized = path.to_string();
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+    normalized
+}
 
 fn validate_config(config: &XhttpConfig) -> Result<()> {
     validate_path(&config.path)?;
